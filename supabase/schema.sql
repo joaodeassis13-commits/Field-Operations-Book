@@ -13,6 +13,7 @@ create table if not exists public.profiles (
   username text not null unique,
   name text not null,
   role text not null check (role in ('operador', 'gestor', 'supervisor')),
+  farm_ids uuid[] not null default '{}', -- fazendas liberadas p/ Operador e Supervisor (Administrador ignora isso, vê tudo)
   created_at timestamptz not null default now()
 );
 
@@ -20,6 +21,7 @@ create table if not exists public.profiles (
 alter table public.profiles drop constraint if exists profiles_role_check;
 alter table public.profiles add constraint profiles_role_check
   check (role in ('operador', 'gestor', 'supervisor'));
+alter table public.profiles add column if not exists farm_ids uuid[] not null default '{}';
 
 create table if not exists public.farms (
   id uuid primary key default gen_random_uuid(),
@@ -51,7 +53,7 @@ create table if not exists public.machines (
   created_at timestamptz not null default now()
 );
 
--- Tipos de operação: os 5 padrão (seed abaixo) + os que o Administrador criar.
+-- Tipos de operação: o sistema não vem com nenhum pronto — o Administrador cadastra cada um pela aba Cadastro.
 create table if not exists public.op_types (
   key text primary key,
   label text not null,
@@ -60,14 +62,6 @@ create table if not exists public.op_types (
   enabled boolean not null default true,
   created_at timestamptz not null default now()
 );
-
-insert into public.op_types (key, label, color, is_builtin, enabled) values
-  ('preparo', 'Preparo de Solo', '#8B5E34', true, true),
-  ('plantio', 'Plantio', '#4F7942', true, true),
-  ('pulverizacao', 'Pulverização', '#3E7C8C', true, true),
-  ('colheita', 'Colheita', '#C9A227', true, true),
-  ('outra', 'Outra', '#8A7F6A', true, true)
-on conflict (key) do nothing;
 
 create table if not exists public.operations (
   id uuid primary key default gen_random_uuid(),
@@ -225,4 +219,12 @@ create policy "operations_delete_gestor" on public.operations for delete to auth
 -- Depois de rodar este arquivo, vá em Authentication > Providers > Email
 -- e DESATIVE "Confirm email" (o app usa e-mails internos fictícios,
 -- então a confirmação por e-mail real não se aplica aqui).
+--
+-- Se você já tinha rodado uma versão anterior deste schema, ela pode ter
+-- criado 5 operações padrão (Preparo de Solo, Plantio, Pulverização,
+-- Colheita, Outra). O sistema agora começa sem nenhuma operação pronta.
+-- Se quiser removê-las (e elas ainda não tiverem lançamentos usando-as),
+-- rode manualmente:
+--   delete from public.op_types where is_builtin = true
+--     and key not in (select distinct op_type from public.operations);
 -- ---------------------------------------------------------------------

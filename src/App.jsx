@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import * as d3 from "d3";
+import * as XLSX from "xlsx";
 import {
-  Sprout, Wheat, Droplet, Layers, Plus, Trash2,
+  Sprout, Plus, Trash2,
   BarChart3, ClipboardList, MapPin, Calendar, Clock,
   ChevronRight, Settings2, Loader2, UploadCloud, LogOut, Lock, Users, Circle,
-  ZoomIn, ZoomOut, Maximize2,
+  ZoomIn, ZoomOut, Maximize2, Download, WifiOff, RefreshCw,
   Sprout as SproutIcon
 } from "lucide-react";
 import {
@@ -12,12 +13,12 @@ import {
 } from "recharts";
 import { supabase } from "./supabaseClient";
 
-const BUILTIN_ICONS = { preparo: Layers, plantio: Sprout, pulverizacao: Droplet, colheita: Wheat, outra: ClipboardList };
-const CUSTOM_OP_COLORS = ["#6B8E4E", "#A9784B", "#4E7C8C", "#9C6B44", "#7C6C97", "#3E8C6E", "#B0793E"];
+const FALLBACK_OP_META = { label: "Operação", color: "#8A7F6A", icon: Circle };
+const CUSTOM_OP_COLORS = ["#9C4F96", "#A9784B", "#4E6C9C", "#B0793E", "#7C4C6C", "#D14B6A", "#5C5C99", "#2E5FA3", "#C9622E", "#C9A227"];
 function buildOpMeta(opTypesRows) {
   const merged = {};
   (opTypesRows || []).forEach(r => {
-    merged[r.key] = { label: r.label, color: r.color, icon: BUILTIN_ICONS[r.key] || Circle, custom: !r.is_builtin };
+    merged[r.key] = { label: r.label, color: r.color, icon: Circle };
   });
   return merged;
 }
@@ -61,7 +62,7 @@ function fieldProgress(field, ops, opMeta) {
   if (!ops.length) return { last: null, meta: null, pct: 0 };
   const sorted = [...ops].sort((a, b) => (a.date < b.date ? 1 : -1));
   const last = sorted[0];
-  const meta = opMeta[last.op_type] || opMeta.outra;
+  const meta = opMeta[last.op_type] || FALLBACK_OP_META;
   const sameType = ops.filter(o => o.op_type === last.op_type);
   const worked = sameType.reduce((s, o) => s + (Number(o.area_worked) || 0), 0);
   const pct = field.area_ha > 0 ? Math.min(100, (worked / field.area_ha) * 100) : 0;
@@ -121,12 +122,29 @@ function computeBBox(fields) {
   return { minLng: minLng - lngPad, minLat: minLat - latPad, maxLng: maxLng + lngPad, maxLat: maxLat + latPad };
 }
 
+/* --------- Offline: cache local + fila de sincronização --------- */
+const LS_REF = "fob_ref_cache_v1";
+const LS_PENDING = "fob_pending_ops_v1";
+function loadRefCache() {
+  try { const raw = localStorage.getItem(LS_REF); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+}
+function saveRefCache(data) {
+  try { localStorage.setItem(LS_REF, JSON.stringify({ ...data, savedAt: Date.now() })); } catch (e) { /* localStorage indisponível ou cheio */ }
+}
+function loadPendingOps() {
+  try { const raw = localStorage.getItem(LS_PENDING); return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
+}
+function savePendingOps(list) {
+  try { localStorage.setItem(LS_PENDING, JSON.stringify(list)); } catch (e) { /* localStorage indisponível ou cheio */ }
+}
+
 export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
   const [dataLoading, setDataLoading] = useState(true);
   const [saveError, setSaveError] = useState(null);
+  const [usingCache, setUsingCache] = useState(false);
 
   const [farms, setFarms] = useState([]);
   const [retiros, setRetiros] = useState([]);
@@ -137,7 +155,10 @@ export default function App() {
   const [profiles, setProfiles] = useState([]);
 
   const [tab, setTab] = useState("painel");
-  const [farmFilter, setFarmFilter] = useState("all");
+
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+  const [pendingOps, setPendingOps] = useState(() => loadPendingOps());
+  const [syncing, setSyncing] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => { setSession(data.session); setAuthLoading(false); });
@@ -150,29 +171,63 @@ export default function App() {
     supabase.from("profiles").select("*").eq("id", session.user.id).single().then(({ data }) => setProfile(data || null));
   }, [session]);
 
+  /* ---------- online/offline ---------- */
+  useEffect(() => {
+    function onOnline() { setIsOnline(true); }
+    function onOffline() { setIsOnline(false); }
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => { window.removeEventListener("online", onOnline); window.removeEventListener("offline", onOffline); };
+  }, []);
+
   const fetchAll = useCallback(async () => {
-    const [f, r, fl, mc, ot, op, pr] = await Promise.all([
-      supabase.from("farms").select("*").order("name"),
-      supabase.from("retiros").select("*").order("name"),
-      supabase.from("fields").select("*").order("name"),
-      supabase.from("machines").select("*").order("name"),
-      supabase.from("op_types").select("*").order("created_at"),
-      supabase.from("operations").select("*").order("date", { ascending: false }),
-      supabase.from("profiles").select("*").order("name"),
-    ]);
-    if (f.data) setFarms(f.data);
-    if (r.data) setRetiros(r.data);
-    if (fl.data) setFields(fl.data);
-    if (mc.data) setMachines(mc.data);
-    if (ot.data) setOpTypesRows(ot.data);
-    if (op.data) setOperations(op.data);
-    if (pr.data) setProfiles(pr.data);
+    if (!navigator.onLine) {
+      const cache = loadRefCache();
+      if (cache) {
+        setFarms(cache.farms || []); setRetiros(cache.retiros || []); setFields(cache.fields || []);
+        setMachines(cache.machines || []); setOpTypesRows(cache.opTypesRows || []);
+        setOperations(cache.operations || []); setProfiles(cache.profiles || []);
+        setUsingCache(true);
+      }
+      setDataLoading(false);
+      return;
+    }
+    try {
+      const [f, r, fl, mc, ot, op, pr] = await Promise.all([
+        supabase.from("farms").select("*").order("name"),
+        supabase.from("retiros").select("*").order("name"),
+        supabase.from("fields").select("*").order("name"),
+        supabase.from("machines").select("*").order("name"),
+        supabase.from("op_types").select("*").order("created_at"),
+        supabase.from("operations").select("*").order("date", { ascending: false }),
+        supabase.from("profiles").select("*").order("name"),
+      ]);
+      if (f.error || r.error || fl.error || mc.error || ot.error || op.error || pr.error) throw new Error("network");
+      const next = {
+        farms: f.data || [], retiros: r.data || [], fields: fl.data || [],
+        machines: mc.data || [], opTypesRows: ot.data || [], operations: op.data || [], profiles: pr.data || [],
+      };
+      setFarms(next.farms); setRetiros(next.retiros); setFields(next.fields);
+      setMachines(next.machines); setOpTypesRows(next.opTypesRows);
+      setOperations(next.operations); setProfiles(next.profiles);
+      setUsingCache(false);
+      saveRefCache(next);
+    } catch (e) {
+      const cache = loadRefCache();
+      if (cache) {
+        setFarms(cache.farms || []); setRetiros(cache.retiros || []); setFields(cache.fields || []);
+        setMachines(cache.machines || []); setOpTypesRows(cache.opTypesRows || []);
+        setOperations(cache.operations || []); setProfiles(cache.profiles || []);
+        setUsingCache(true);
+      }
+    }
     setDataLoading(false);
   }, []);
 
   useEffect(() => {
     if (!profile) return;
     fetchAll();
+    if (!navigator.onLine) return;
     const channel = supabase
       .channel("field-ops-changes")
       .on("postgres_changes", { event: "*", schema: "public", table: "farms" }, fetchAll)
@@ -193,8 +248,33 @@ export default function App() {
     // eslint-disable-next-line
   }, [profile && profile.id, profile && profile.role]);
 
+  /* ---------- sincronização de lançamentos pendentes ---------- */
+  const syncPending = useCallback(async () => {
+    if (syncing) return;
+    const list = loadPendingOps();
+    if (!list.length || !navigator.onLine) return;
+    setSyncing(true);
+    const remaining = [];
+    for (const rec of list) {
+      const { _localId, ...toInsert } = rec;
+      const { error } = await supabase.from("operations").insert(toInsert);
+      if (error) remaining.push(rec);
+    }
+    savePendingOps(remaining);
+    setPendingOps(remaining);
+    setSyncing(false);
+    if (remaining.length < list.length) fetchAll();
+    // eslint-disable-next-line
+  }, [fetchAll]);
+
+  useEffect(() => {
+    if (isOnline && pendingOps.length > 0) syncPending();
+    // eslint-disable-next-line
+  }, [isOnline]);
+
   /* ---------- auth ---------- */
   async function handleLogin(username, password) {
+    if (!navigator.onLine) return "Sem conexão — é preciso internet para fazer login pela primeira vez neste aparelho.";
     const { data: email, error: rpcError } = await supabase.rpc("get_email_by_username", { p_username: username.trim() });
     if (rpcError || !email) return "Usuário ou senha inválidos.";
     const { error } = await supabase.auth.signInWithPassword({ email, password });
@@ -258,45 +338,42 @@ export default function App() {
     const { error } = await supabase.from("machines").delete().eq("id", id);
     if (error) setSaveError(error.message); else fetchAll();
   }
-  async function toggleOpType(key) {
-    const row = opTypesRows.find(r => r.key === key);
-    if (!row) return null;
-    const enabledCount = opTypesRows.filter(r => r.enabled).length;
-    if (row.enabled && enabledCount <= 1) return "É preciso manter ao menos uma operação ativa.";
-    const { error } = await supabase.from("op_types").update({ enabled: !row.enabled }).eq("key", key);
-    if (error) return error.message;
-    await fetchAll();
-    return null;
-  }
   async function addCustomOpType(name) {
     const dup = opTypesRows.some(r => r.label.trim().toLowerCase() === name.trim().toLowerCase());
     if (dup) return "Já existe uma operação com esse nome.";
-    const customCount = opTypesRows.filter(r => !r.is_builtin).length;
-    const color = CUSTOM_OP_COLORS[customCount % CUSTOM_OP_COLORS.length];
+    const color = CUSTOM_OP_COLORS[opTypesRows.length % CUSTOM_OP_COLORS.length];
     const { error } = await supabase.from("op_types").insert({ key: uid(), label: name.trim(), color, is_builtin: false, enabled: true });
     if (error) return error.message;
     await fetchAll();
     return null;
   }
-  async function removeCustomOpType(key) {
-    const row = opTypesRows.find(r => r.key === key);
-    const enabledCount = opTypesRows.filter(r => r.enabled).length;
-    if (row && row.enabled && enabledCount <= 1) return "É preciso manter ao menos uma operação ativa.";
-    const { error } = await supabase.from("op_types").delete().eq("key", key);
-    if (error) return error.message;
-    await fetchAll();
-    return null;
-  }
   async function addOperation(rec) {
+    if (!navigator.onLine) {
+      const local = { ...rec, _localId: uid() };
+      const next = [...loadPendingOps(), local];
+      savePendingOps(next);
+      setPendingOps(next);
+      setOperations(prev => [{ ...rec, id: local._localId, _pending: true }, ...prev]);
+      return;
+    }
     const { error } = await supabase.from("operations").insert(rec);
-    if (error) setSaveError(error.message); else fetchAll();
+    if (error) {
+      // provável falha de rede no meio do caminho: guarda localmente também
+      const local = { ...rec, _localId: uid() };
+      const next = [...loadPendingOps(), local];
+      savePendingOps(next);
+      setPendingOps(next);
+      setOperations(prev => [{ ...rec, id: local._localId, _pending: true }, ...prev]);
+    } else {
+      fetchAll();
+    }
   }
   async function deleteOperation(id) {
     const { error } = await supabase.from("operations").delete().eq("id", id);
     if (error) setSaveError(error.message); else fetchAll();
   }
-  async function addUser({ name, username, password, role }) {
-    const { data, error } = await supabase.functions.invoke("create-user", { body: { name, username, password, role } });
+  async function addUser({ name, username, password, role, farmIds }) {
+    const { data, error } = await supabase.functions.invoke("create-user", { body: { name, username, password, role, farmIds } });
     if (error) return error.message || "Não foi possível criar o usuário.";
     if (data?.error) return data.error;
     await fetchAll();
@@ -319,41 +396,45 @@ export default function App() {
 
   const tabs = TABS_BY_ROLE[profile.role] || TABS_BY_ROLE.operador;
   const opMeta = buildOpMeta(opTypesRows);
-  const enabledOpTypes = opTypesRows.filter(r => r.enabled).map(r => r.key);
-  const hasFarms = farms.length > 0;
-  const hasFields = fields.length > 0;
-  const visibleFarms = farmFilter === "all" ? farms : farms.filter(f => f.id === farmFilter);
-  const visibleRetiros = farmFilter === "all" ? retiros : retiros.filter(r => r.farm_id === farmFilter);
-  const visibleFields = farmFilter === "all" ? fields : fields.filter(f => f.farm_id === farmFilter);
-  const visibleOps = farmFilter === "all" ? operations : operations.filter(o => o.farm_id === farmFilter);
+  const enabledOpTypes = opTypesRows.map(r => r.key);
+
+  const myFarmIds = profile.role === "gestor" ? null : (profile.farm_ids || []);
+  const scopedFarms = myFarmIds === null ? farms : farms.filter(f => myFarmIds.includes(f.id));
+  const scopedRetiros = myFarmIds === null ? retiros : retiros.filter(r => myFarmIds.includes(r.farm_id));
+  const scopedFields = myFarmIds === null ? fields : fields.filter(f => myFarmIds.includes(f.farm_id));
+  const scopedOperations = myFarmIds === null ? operations : operations.filter(o => myFarmIds.includes(o.farm_id));
+
+  const hasFarms = scopedFarms.length > 0;
+  const hasFields = scopedFields.length > 0;
 
   return (
     <Shell>
-      <Header farms={farms} farmFilter={farmFilter} setFarmFilter={setFarmFilter} tab={tab} setTab={setTab} tabs={tabs} currentUser={profile} onLogout={handleLogout} />
+      <Header tab={tab} setTab={setTab} tabs={tabs} currentUser={profile} onLogout={handleLogout} />
+      <OfflineBanner isOnline={isOnline} pendingCount={pendingOps.length} syncing={syncing} usingCache={usingCache} onSyncNow={syncPending} />
       {saveError && <div className="saveError">{saveError} <button className="dismissErr" onClick={() => setSaveError(null)}>×</button></div>}
       <main className="content">
         {tab === "painel" && (
-          <Painel farms={visibleFarms} retiros={visibleRetiros} fields={visibleFields} operations={visibleOps} profiles={profiles}
+          <Painel farms={scopedFarms} retiros={scopedRetiros} fields={scopedFields} operations={scopedOperations} profiles={profiles}
             hasFarms={hasFarms} hasFields={hasFields} enabledOpTypes={enabledOpTypes} opMeta={opMeta}
             goCadastro={() => setTab("cadastro")} goLancamento={profile.role === "operador" ? () => setTab("lancamento") : null}
             canGoCadastro={profile.role === "gestor"} />
         )}
         {tab === "lancamento" && profile.role === "operador" && (
-          <Lancamento farms={farms} retiros={retiros} fields={fields} hasFarms={hasFarms} hasFields={hasFields}
-            enabledOpTypes={enabledOpTypes} opMeta={opMeta} machines={machines} currentUser={profile} onSubmit={addOperation} />
+          <Lancamento farms={scopedFarms} retiros={scopedRetiros} fields={scopedFields} hasFarms={hasFarms} hasFields={hasFields}
+            enabledOpTypes={enabledOpTypes} opMeta={opMeta} machines={machines} operations={scopedOperations} currentUser={profile} onSubmit={addOperation} />
         )}
         {tab === "historico" && (
-          <Historico farms={farms} retiros={retiros} fields={fields} operations={operations} profiles={profiles} currentUser={profile} opMeta={opMeta} onDelete={deleteOperation} />
+          <Historico farms={scopedFarms} retiros={scopedRetiros} fields={scopedFields} operations={scopedOperations} profiles={profiles} currentUser={profile} opMeta={opMeta} onDelete={deleteOperation} />
         )}
         {tab === "cadastro" && profile.role === "gestor" && (
           <Cadastro
             farms={farms} retiros={retiros} fields={fields} machines={machines} opTypesRows={opTypesRows} opMeta={opMeta}
-            enabledOpTypes={enabledOpTypes} users={profiles} currentUser={profile}
+            users={profiles} currentUser={profile}
             onAddFarm={addFarm} onRemoveFarm={removeFarm}
             onAddRetiro={addRetiro} onRemoveRetiro={removeRetiro}
             onRemoveField={removeField} onImportKml={importKml}
             onAddMachine={addMachine} onRemoveMachine={removeMachine}
-            onToggleOpType={toggleOpType} onAddCustomOpType={addCustomOpType} onRemoveCustomOpType={removeCustomOpType}
+            onAddCustomOpType={addCustomOpType}
             onAddUser={addUser} onRemoveUser={removeUser}
           />
         )}
@@ -364,6 +445,25 @@ export default function App() {
 }
 
 function Shell({ children }) { return <div className="app">{children}</div>; }
+
+function OfflineBanner({ isOnline, pendingCount, syncing, usingCache, onSyncNow }) {
+  if (isOnline && pendingCount === 0 && !usingCache) return null;
+  return (
+    <div className={"offlineBanner" + (!isOnline ? " offline" : "")}>
+      {!isOnline ? (
+        <><WifiOff size={13} /> Sem conexão — {pendingCount > 0 ? `${pendingCount} lançamento(s) serão enviados quando a internet voltar.` : "os dados mostrados são os últimos salvos neste aparelho."}</>
+      ) : pendingCount > 0 ? (
+        <>
+          <RefreshCw size={13} className={syncing ? "spin" : ""} />
+          {syncing ? "Sincronizando lançamentos pendentes…" : `${pendingCount} lançamento(s) pendente(s) de sincronização.`}
+          {!syncing && <button className="offlineSyncBtn" onClick={onSyncNow} type="button">Sincronizar agora</button>}
+        </>
+      ) : (
+        <>Mostrando dados salvos neste aparelho (sem conexão no último carregamento).</>
+      )}
+    </div>
+  );
+}
 
 /* ---------------- LOGIN / SETUP ---------------- */
 
@@ -419,7 +519,7 @@ function LoginOrSetup({ onLogin, onFirstRunCreate }) {
 
 /* ---------------- HEADER ---------------- */
 
-function Header({ farms, farmFilter, setFarmFilter, tab, setTab, tabs, currentUser, onLogout }) {
+function Header({ tab, setTab, tabs, currentUser, onLogout }) {
   const roleMeta = ROLE_META[currentUser.role] || ROLE_META.operador;
   return (
     <header className="header">
@@ -432,13 +532,6 @@ function Header({ farms, farmFilter, setFarmFilter, tab, setTab, tabs, currentUs
           </div>
         </div>
         <div className="headerRight">
-          <div className="farmSelect">
-            <MapPin size={14} />
-            <select value={farmFilter} onChange={e => setFarmFilter(e.target.value)}>
-              <option value="all">Todas as fazendas</option>
-              {farms.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
-            </select>
-          </div>
           <div className="userBadge">
             <span className="userName">{currentUser.name}</span>
             <span className="rolePill" style={{ "--role-color": roleMeta.color }}>{roleMeta.label}</span>
@@ -456,11 +549,24 @@ function Header({ farms, farmFilter, setFarmFilter, tab, setTab, tabs, currentUs
 /* ---------------- PAINEL ---------------- */
 
 function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFields, enabledOpTypes, opMeta, goCadastro, goLancamento, canGoCadastro }) {
+  const [farmFilter, setFarmFilter] = useState("all");
   const [operFilter, setOperFilter] = useState("all");
   const [retiroFilter, setRetiroFilter] = useState("all");
   const [operatorFilter, setOperatorFilter] = useState("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const [chartMode, setChartMode] = useState("dias");
+
+  useEffect(() => {
+    setRetiroFilter(prev => {
+      if (prev === "all") return prev;
+      const r = (retiros || []).find(x => x.id === prev);
+      if (!r) return "all";
+      if (farmFilter !== "all" && r.farm_id !== farmFilter) return "all";
+      return prev;
+    });
+    // eslint-disable-next-line
+  }, [farmFilter]);
 
   if (!hasFarms || !hasFields) {
     return (
@@ -482,10 +588,13 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
     }
   });
   operatorOptions.sort((a, b) => a.name.localeCompare(b.name));
-  const retiroOptions = [...(retiros || [])].sort((a, b) => a.name.localeCompare(b.name));
 
-  const hasActiveFilters = operFilter !== "all" || retiroFilter !== "all" || operatorFilter !== "all" || dateFrom || dateTo;
+  const farmOptions = [...farms].sort((a, b) => a.name.localeCompare(b.name));
+  const retiroOptions = [...(retiros || [])].filter(r => farmFilter === "all" || r.farm_id === farmFilter).sort((a, b) => a.name.localeCompare(b.name));
+
+  const hasActiveFilters = farmFilter !== "all" || operFilter !== "all" || retiroFilter !== "all" || operatorFilter !== "all" || dateFrom || dateTo;
   const filteredOperations = operations.filter(o => {
+    if (farmFilter !== "all" && o.farm_id !== farmFilter) return false;
     if (operFilter !== "all" && o.op_type !== operFilter) return false;
     if (retiroFilter !== "all" && o.retiro_id !== retiroFilter) return false;
     if (operatorFilter !== "all" && o.operator_id !== operatorFilter) return false;
@@ -505,24 +614,39 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
   const horasPorDia = diasComLancamento > 0 ? totalHoras / diasComLancamento : null;
 
   const msPerDay = 24 * 60 * 60 * 1000;
-  let rangeEnd = dateTo ? new Date(dateTo + "T00:00:00") : new Date();
-  let rangeStart = dateFrom ? new Date(dateFrom + "T00:00:00") : (dateTo ? new Date(new Date(dateTo + "T00:00:00").getTime() - 13 * msPerDay) : new Date(rangeEnd.getTime() - 13 * msPerDay));
-  let spanDays = Math.round((rangeEnd - rangeStart) / msPerDay) + 1;
-  if (spanDays < 1) spanDays = 1;
-  const chartCapped = spanDays > 60;
-  if (chartCapped) { rangeStart = new Date(rangeEnd.getTime() - 59 * msPerDay); spanDays = 60; }
-  const days = [];
-  for (let i = 0; i < spanDays; i++) {
-    const d = new Date(rangeStart.getTime() + i * msPerDay);
-    const iso = d.toISOString().slice(0, 10);
-    const total = filteredOperations.filter(o => o.date === iso).reduce((s, o) => s + (Number(o.area_worked) || 0), 0);
-    days.push({ label: iso.slice(8, 10) + "/" + iso.slice(5, 7), ha: Math.round(total * 10) / 10 });
+  let chartData = [];
+  let chartCapped = false;
+  if (chartMode === "dias") {
+    let rangeEnd = dateTo ? new Date(dateTo + "T00:00:00") : new Date();
+    let rangeStart = dateFrom ? new Date(dateFrom + "T00:00:00") : (dateTo ? new Date(new Date(dateTo + "T00:00:00").getTime() - 13 * msPerDay) : new Date(rangeEnd.getTime() - 13 * msPerDay));
+    let spanDays = Math.round((rangeEnd - rangeStart) / msPerDay) + 1;
+    if (spanDays < 1) spanDays = 1;
+    if (spanDays > 60) { rangeStart = new Date(rangeEnd.getTime() - 59 * msPerDay); spanDays = 60; chartCapped = true; }
+    for (let i = 0; i < spanDays; i++) {
+      const d = new Date(rangeStart.getTime() + i * msPerDay);
+      const iso = d.toISOString().slice(0, 10);
+      const total = filteredOperations.filter(o => o.date === iso).reduce((s, o) => s + (Number(o.area_worked) || 0), 0);
+      chartData.push({ label: iso.slice(8, 10) + "/" + iso.slice(5, 7), ha: Math.round(total * 10) / 10 });
+    }
+  } else {
+    const rangeEndD = dateTo ? new Date(dateTo + "T00:00:00") : new Date();
+    let rangeStartD;
+    if (dateFrom) rangeStartD = new Date(dateFrom + "T00:00:00");
+    else { rangeStartD = new Date(rangeEndD); rangeStartD.setMonth(rangeStartD.getMonth() - 11); }
+    let cursor = new Date(rangeStartD.getFullYear(), rangeStartD.getMonth(), 1);
+    const endCursor = new Date(rangeEndD.getFullYear(), rangeEndD.getMonth(), 1);
+    let months = [];
+    while (cursor <= endCursor && months.length < 300) { months.push(new Date(cursor)); cursor.setMonth(cursor.getMonth() + 1); }
+    if (months.length > 24) { months = months.slice(months.length - 24); chartCapped = true; }
+    const MESES_ABREV = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+    chartData = months.map(m => {
+      const key = `${m.getFullYear()}-${String(m.getMonth() + 1).padStart(2, "0")}`;
+      const total = filteredOperations.filter(o => o.date && o.date.startsWith(key)).reduce((s, o) => s + (Number(o.area_worked) || 0), 0);
+      return { label: `${MESES_ABREV[m.getMonth()]}/${String(m.getFullYear()).slice(2)}`, ha: Math.round(total * 10) / 10 };
+    });
   }
-  const chartTitle = (dateFrom || dateTo)
-    ? (chartCapped ? "Área trabalhada — período selecionado (últimos 60 dias do período)" : "Área trabalhada — período selecionado")
-    : "Área trabalhada — últimos 14 dias";
 
-  const mapFields = retiroFilter === "all" ? fields : fields.filter(f => f.retiro_id === retiroFilter);
+  const mapFields = fields.filter(f => (farmFilter === "all" || f.farm_id === farmFilter) && (retiroFilter === "all" || f.retiro_id === retiroFilter));
   const mapPolyFields = mapFields.filter(f => f.coords && f.coords.length >= 3);
   const mapPlainFields = mapFields.filter(f => !(f.coords && f.coords.length >= 3));
   const anyPolygon = fields.some(f => f.coords && f.coords.length >= 3);
@@ -533,6 +657,10 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
     mapHeading = r ? `Retiro: ${r.name}` : "Retiro selecionado";
     const farmOfRetiro = farms.find(fa => fa.id === r?.farm_id);
     mapSubheading = farmOfRetiro ? farmOfRetiro.name : null;
+  } else if (farmFilter !== "all") {
+    const fa = farmOptions.find(x => x.id === farmFilter);
+    mapHeading = fa ? fa.name : "Fazenda selecionada";
+    mapSubheading = null;
   } else {
     const retiroIdsShown = new Set(mapFields.map(f => f.retiro_id).filter(Boolean));
     const farmNames = [...new Set(mapFields.map(f => farms.find(fa => fa.id === f.farm_id)?.name).filter(Boolean))];
@@ -546,10 +674,17 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
         <div className="panelHead">
           <h2>Filtros</h2>
           {hasActiveFilters && (
-            <button className="filterClear" type="button" onClick={() => { setOperFilter("all"); setRetiroFilter("all"); setOperatorFilter("all"); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
+            <button className="filterClear" type="button" onClick={() => { setFarmFilter("all"); setOperFilter("all"); setRetiroFilter("all"); setOperatorFilter("all"); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
           )}
         </div>
         <div className="filterRow">
+          <div className="filterGroup">
+            <span className="filterLabel">Fazenda</span>
+            <select value={farmFilter} onChange={e => setFarmFilter(e.target.value)}>
+              <option value="all">Todas</option>
+              {farmOptions.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+            </select>
+          </div>
           <div className="filterGroup">
             <span className="filterLabel">Operação</span>
             <select value={operFilter} onChange={e => setOperFilter(e.target.value)}>
@@ -583,21 +718,28 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
       </section>
 
       <div className="kpiGrid">
-        <KpiCard label="Área trabalhada no período" value={fmtNum(areaPeriodo)} unit="ha" icon={Layers} accent="#4F7942" />
+        <KpiCard label="Área trabalhada no período" value={fmtNum(areaPeriodo)} unit="ha" icon={MapPin} accent="#4F7942" />
         <KpiCard label="Rendimento operacional" value={rendimentoOperacional !== null ? fmtNum(rendimentoOperacional, 2) : "—"} unit="ha/h" icon={BarChart3} accent="#3E7C8C" />
         <KpiCard label="Área média por dia" value={areaMediaPorDia !== null ? fmtNum(areaMediaPorDia, 1) : "—"} unit={areaMediaPorDia !== null ? "ha/dia" : ""} icon={Calendar} accent="#C9A227" />
         <KpiCard label="Horas trabalhadas por dia" value={horasPorDia !== null ? fmtNum(horasPorDia, 1) : "—"} unit={horasPorDia !== null ? "h/dia" : ""} icon={Clock} accent="#A85C36" />
       </div>
 
       <section className="panel">
-        <div className="panelHead"><h2>{chartTitle}</h2></div>
+        <div className="panelHead">
+          <h2>Área trabalhada</h2>
+          <div className="chartModeRow">
+            <button type="button" className={"chartModeBtn" + (chartMode === "dias" ? " active" : "")} onClick={() => setChartMode("dias")}>Dias</button>
+            <button type="button" className={"chartModeBtn" + (chartMode === "meses" ? " active" : "")} onClick={() => setChartMode("meses")}>Meses</button>
+          </div>
+        </div>
+        {chartCapped && <p className="panelHint" style={{ marginBottom: 8 }}>Mostrando só o trecho mais recente do período selecionado.</p>}
         <div className="chartWrap">
           <ResponsiveContainer width="100%" height={220}>
-            <BarChart data={days} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+            <BarChart data={chartData} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
               <CartesianGrid stroke="rgba(36,27,20,0.08)" vertical={false} />
               <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#6b5c47" }} axisLine={{ stroke: "rgba(36,27,20,0.15)" }} tickLine={false} />
               <YAxis tick={{ fontSize: 11, fill: "#6b5c47" }} axisLine={false} tickLine={false} width={34} />
-              <Tooltip formatter={(v) => [`${v} ha`, "Área"]} labelFormatter={(l) => `Dia ${l}`} contentStyle={{ background: "#EDE6D6", border: "1px solid rgba(36,27,20,0.15)", borderRadius: 6, fontSize: 12 }} />
+              <Tooltip formatter={(v) => [`${v} ha`, "Área"]} labelFormatter={(l) => (chartMode === "dias" ? `Dia ${l}` : l)} contentStyle={{ background: "#EDE6D6", border: "1px solid rgba(36,27,20,0.15)", borderRadius: 6, fontSize: 12 }} />
               <Bar dataKey="ha" radius={[3, 3, 0, 0]} fill="#4F7942" />
             </BarChart>
           </ResponsiveContainer>
@@ -605,7 +747,7 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
       </section>
 
       <section className="panel">
-        <div className="panelHead"><h2>Mapa das fazendas</h2><span className="panelHint">Preenchimento cresce conforme a etapa avança · cor = última operação</span></div>
+        <div className="panelHead"><h2>Mapa das fazendas</h2></div>
         <MapLegend enabledOpTypes={enabledOpTypes} opMeta={opMeta} />
         {mapFields.length > 0 ? (
           <div className="farmMapGroup">
@@ -622,11 +764,7 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
         ) : (
           <p className="mapTip">Nenhum talhão encontrado para os filtros atuais.</p>
         )}
-        {!anyPolygon && (
-          <p className="mapTip">
-            {canGoCadastro ? <>Dica: importe um arquivo KML com os polígonos dos talhões na aba <strong>Cadastro</strong>.</> : "Ainda não há polígonos importados para essas fazendas."}
-          </p>
-        )}
+        {!anyPolygon && <p className="mapTip">{canGoCadastro ? <>Dica: importe um arquivo KML com os polígonos dos talhões na aba <strong>Cadastro</strong>.</> : "Ainda não há polígonos importados para essas fazendas."}</p>}
       </section>
 
       {goLancamento && <div className="quickAdd"><button className="btnPrimary" onClick={goLancamento}><Plus size={16} /> Novo lançamento</button></div>}
@@ -674,19 +812,34 @@ function FarmPolygonMap({ fields, operations, opMeta }) {
     setDragging(true);
     dragRef.current = { startX: e.clientX, startY: e.clientY, panX: pan.x, panY: pan.y };
   }
+  function handleTouchStart(e) {
+    if (zoom <= 1 || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    setDragging(true);
+    dragRef.current = { startX: t.clientX, startY: t.clientY, panX: pan.x, panY: pan.y };
+  }
   useEffect(() => {
     if (!dragging) return;
-    function onMove(e) {
+    function applyDelta(clientX, clientY) {
       const svg = svgRef.current; if (!svg) return;
       const rect = svg.getBoundingClientRect();
-      const dx = (e.clientX - dragRef.current.startX) * (width / rect.width);
-      const dy = (e.clientY - dragRef.current.startY) * (height / rect.height);
+      const dx = (clientX - dragRef.current.startX) * (width / rect.width);
+      const dy = (clientY - dragRef.current.startY) * (height / rect.height);
       setPan(clampPan({ x: dragRef.current.panX + dx, y: dragRef.current.panY + dy }, zoom));
     }
+    function onMove(e) { applyDelta(e.clientX, e.clientY); }
     function onUp() { setDragging(false); }
+    function onTouchMove(e) { if (e.touches.length !== 1) return; e.preventDefault(); applyDelta(e.touches[0].clientX, e.touches[0].clientY); }
+    function onTouchEnd() { setDragging(false); }
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onTouchEnd);
+    window.addEventListener("touchcancel", onTouchEnd);
+    return () => {
+      window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("touchmove", onTouchMove); window.removeEventListener("touchend", onTouchEnd); window.removeEventListener("touchcancel", onTouchEnd);
+    };
     // eslint-disable-next-line
   }, [dragging, zoom]);
   function zoomIn() { setZoom(z => { const nz = Math.min(4, Math.round((z + 0.5) * 100) / 100); setPan(p => clampPan(p, nz)); return nz; }); }
@@ -753,7 +906,7 @@ function FarmPolygonMap({ fields, operations, opMeta }) {
         <button type="button" className="mapZoomBtn" onClick={zoomOut} title="Diminuir zoom"><ZoomOut size={14} /></button>
         <button type="button" className="mapZoomBtn" onClick={zoomReset} title="Restaurar zoom"><Maximize2 size={13} /></button>
       </div>
-      <svg ref={svgRef} className={"farmSvgMap" + (zoom > 1 ? (dragging ? " dragging" : " draggable") : "")} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet" onMouseDown={handleMouseDown}>
+      <svg ref={svgRef} className={"farmSvgMap" + (zoom > 1 ? (dragging ? " dragging" : " draggable") : "")} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet" onMouseDown={handleMouseDown} onTouchStart={handleTouchStart}>
         <defs>
           <pattern id="soilFallback" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(35)">
             <rect width="12" height="12" fill="#332a1c" /><rect width="5" height="12" fill="#3c3122" />
@@ -799,7 +952,7 @@ function FarmPolygonMap({ fields, operations, opMeta }) {
 
 function FieldTile({ field, operations, opMeta }) {
   const { last, meta, pct } = fieldProgress(field, operations, opMeta);
-  const Icon = meta ? meta.icon : Layers;
+  const Icon = meta ? meta.icon : Circle;
   const baseColor = meta ? meta.color : SOIL_BARE;
   const size = Math.max(96, Math.min(180, Math.sqrt(field.area_ha || 1) * 34));
   return (
@@ -816,7 +969,7 @@ function FieldTile({ field, operations, opMeta }) {
 
 /* ---------------- LANÇAMENTO ---------------- */
 
-function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpTypes, opMeta, machines, currentUser, onSubmit }) {
+function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpTypes, opMeta, machines, operations, currentUser, onSubmit }) {
   const opTypeList = Object.entries(opMeta).filter(([key]) => enabledOpTypes.includes(key));
   const [date, setDate] = useState(todayISO());
   const [farmId, setFarmId] = useState("");
@@ -826,6 +979,7 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
   const [machineId, setMachineId] = useState("");
   const [areaWorked, setAreaWorked] = useState("");
   const [horIni, setHorIni] = useState("");
+  const [horIniSuggested, setHorIniSuggested] = useState(false);
   const [horFim, setHorFim] = useState("");
   const [quantity, setQuantity] = useState("");
   const [unit, setUnit] = useState("sc");
@@ -841,7 +995,7 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
   let horimetroError = "";
   if (horIniNum === null || horFimNum === null) horimetroError = "Informe o horímetro inicial e o horímetro final.";
   else if (horFimNum < horIniNum) horimetroError = "O horímetro final não pode ser menor que o inicial.";
-  else if (horFimNum - horIniNum > 24) horimetroError = "A diferença entre os horímetros não pode ser maior que 24 horas.";
+  else if (horFimNum - horIniNum > 12) horimetroError = "A diferença entre os horímetros não pode ser maior que 12 horas.";
   const hoursComputed = horIniNum !== null && horFimNum !== null && !horimetroError ? Math.round((horFimNum - horIniNum) * 100) / 100 : null;
 
   const selectedField = fieldsOfRetiro.find(f => f.id === fieldId) || null;
@@ -857,8 +1011,21 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
   useEffect(() => { if (opType && !opTypeList.find(([key]) => key === opType)) setOpType(""); /* eslint-disable-next-line */ }, [enabledOpTypes.join(",")]);
   useEffect(() => { if (machineId && !(machines || []).find(m => m.id === machineId)) setMachineId(""); /* eslint-disable-next-line */ }, [machines && machines.length]);
 
+  // sugere o horímetro inicial a partir do último horímetro final lançado para a máquina escolhida
+  useEffect(() => {
+    if (!machineId) return;
+    if (horIni !== "" && !horIniSuggested) return;
+    const machineOps = (operations || []).filter(o => o.machine_id === machineId && o.horimetro_final !== null && o.horimetro_final !== undefined);
+    if (!machineOps.length) { setHorIni(""); setHorIniSuggested(false); return; }
+    const sorted = [...machineOps].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.id < b.id ? 1 : -1)));
+    setHorIni(String(sorted[0].horimetro_final));
+    setHorIniSuggested(true);
+    // eslint-disable-next-line
+  }, [machineId]);
+
   if (!hasFarms || !hasFields) return <EmptyState title={!hasFarms ? "Nenhuma fazenda cadastrada" : "Nenhum talhão cadastrado"} text="Peça a um Administrador para cadastrar pelo menos uma fazenda, um retiro e um talhão antes de lançar operações." />;
 
+  const selectedMachine = (machines || []).find(m => m.id === machineId) || null;
   const canSubmit = farmId && retiroId && fieldId && opType && machineId && areaWorked && !horimetroError && !areaError && !busy;
 
   async function handleRegister() {
@@ -867,19 +1034,20 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
     await onSubmit({
       date, farm_id: farmId, retiro_id: retiroId, field_id: fieldId, op_type: opType,
       machine_id: machineId,
+      machine: selectedMachine ? selectedMachine.name : null,
       area_worked: parseFloat(areaWorked) || 0,
       horimetro_inicial: horIniNum,
       horimetro_final: horFimNum,
       hours: hoursComputed || 0,
-      quantity: opType === "colheita" && quantity ? parseFloat(quantity) : null,
-      unit: opType === "colheita" ? unit : null,
+      quantity: quantity ? parseFloat(quantity) : null,
+      unit: quantity ? unit : null,
       operator_id: currentUser.id,
       notes: notes.trim() || null,
     });
     setBusy(false);
     setConfirmMsg("Lançamento registrado.");
     setFarmId(""); setRetiroId(""); setFieldId(""); setOpType(""); setMachineId("");
-    setAreaWorked(""); setHorIni(""); setHorFim(""); setQuantity(""); setNotes("");
+    setAreaWorked(""); setHorIni(""); setHorIniSuggested(false); setHorFim(""); setQuantity(""); setNotes("");
     setTimeout(() => setConfirmMsg(""), 2500);
   }
 
@@ -920,13 +1088,14 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
             </select>
           </Field>
           <Field label="Área trabalhada (ha)"><input type="number" min="0" step="0.1" value={areaWorked} onChange={e => setAreaWorked(e.target.value)} /></Field>
-          <Field label="Horímetro inicial"><input type="number" min="0" step="0.1" value={horIni} onChange={e => setHorIni(e.target.value)} /></Field>
+          <Field label={horIniSuggested && horIni !== "" ? "Horímetro inicial (sugerido)" : "Horímetro inicial"}>
+            <input type="number" min="0" step="0.1" value={horIni} onChange={e => { setHorIni(e.target.value); setHorIniSuggested(false); }} />
+          </Field>
           <Field label="Horímetro final"><input type="number" min="0" step="0.1" value={horFim} onChange={e => setHorFim(e.target.value)} /></Field>
-          {opType === "colheita" && (<>
-            <Field label="Quantidade colhida"><input type="number" min="0" step="0.1" value={quantity} onChange={e => setQuantity(e.target.value)} /></Field>
-            <Field label="Unidade"><select value={unit} onChange={e => setUnit(e.target.value)}>{UNIDADES.map(u => <option key={u} value={u}>{u}</option>)}</select></Field>
-          </>)}
+          <Field label="Quantidade colhida/produzida (opcional)"><input type="number" min="0" step="0.1" value={quantity} onChange={e => setQuantity(e.target.value)} /></Field>
+          <Field label="Unidade"><select value={unit} onChange={e => setUnit(e.target.value)}>{UNIDADES.map(u => <option key={u} value={u}>{u}</option>)}</select></Field>
         </div>
+        {opTypeList.length === 0 && <div className="authError horimetroError">Nenhuma operação cadastrada ainda. Peça a um Administrador para cadastrar as operações em Cadastro antes de lançar.</div>}
         {!(machines && machines.length) && <div className="authError horimetroError">Nenhuma máquina cadastrada ainda. Peça a um Administrador para cadastrar máquinas em Cadastro antes de lançar operações.</div>}
         {areaError && <div className="authError horimetroError">{areaError}</div>}
         {horimetroError && <div className="authError horimetroError">{horimetroError}</div>}
@@ -960,6 +1129,33 @@ function Historico({ farms, retiros, fields, operations, profiles, currentUser, 
     .filter(o => opType === "all" || o.op_type === opType)
     .sort((a, b) => (a.date < b.date ? 1 : -1));
 
+  function handleExport() {
+    const data = [...operations].sort((a, b) => (a.date < b.date ? 1 : -1)).map(o => {
+      const meta = opMeta[o.op_type] || FALLBACK_OP_META;
+      return {
+        "Data": fmtDateBR(o.date),
+        "Fazenda": farmName(o.farm_id),
+        "Retiro": retiroName(o.retiro_id),
+        "Talhão": fieldName(o.field_id),
+        "Operação": meta.label,
+        "Máquina": o.machine || "",
+        "Área trabalhada (ha)": o.area_worked ?? "",
+        "Horímetro inicial": o.horimetro_inicial ?? "",
+        "Horímetro final": o.horimetro_final ?? "",
+        "Horas": o.hours ?? "",
+        "Quantidade": o.quantity ?? "",
+        "Unidade": o.unit || "",
+        "Operador": operatorName(o.operator_id),
+        "Observações": o.notes || "",
+      };
+    });
+    const ws = XLSX.utils.json_to_sheet(data);
+    ws["!cols"] = Object.keys(data[0] || {}).map(k => ({ wch: Math.max(12, k.length + 2) }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Lançamentos");
+    XLSX.writeFile(wb, `lancamentos_${todayISO()}.xlsx`);
+  }
+
   if (operations.length === 0) return <EmptyState title="Nenhum lançamento ainda" text="Os lançamentos registrados vão aparecer aqui." />;
 
   return (
@@ -976,6 +1172,7 @@ function Historico({ farms, retiros, fields, operations, profiles, currentUser, 
           <select value={opType} onChange={e => setOpType(e.target.value)}>
             <option value="all">Todas as operações</option>{Object.entries(opMeta).map(([k, m]) => <option key={k} value={k}>{m.label}</option>)}
           </select>
+          <button className="btnPrimary exportBtn" type="button" onClick={handleExport}><Download size={14} /> Exportar Excel</button>
         </div>
       </div>
       <div className="tableWrap">
@@ -983,17 +1180,17 @@ function Historico({ farms, retiros, fields, operations, profiles, currentUser, 
           <thead><tr><th>Data</th><th>Fazenda</th><th>Retiro</th><th>Talhão</th><th>Operação</th><th>Máquina</th><th>Área</th><th>Horas</th><th>Rendimento</th><th>Operador</th>{canDelete && <th></th>}</tr></thead>
           <tbody>
             {rows.map(o => {
-              const meta = opMeta[o.op_type] || opMeta.outra;
+              const meta = opMeta[o.op_type] || FALLBACK_OP_META;
               return (
-                <tr key={o.id}>
+                <tr key={o.id} className={o._pending ? "pendingRow" : ""}>
                   <td>{fmtDateBR(o.date)}</td><td>{farmName(o.farm_id)}</td><td>{retiroName(o.retiro_id)}</td><td>{fieldName(o.field_id)}</td>
                   <td><span className="badge" style={{ "--badge-color": meta.color }}>{meta.label}</span></td>
                   <td>{o.machine || "—"}</td>
                   <td>{fmtNum(o.area_worked)} ha</td>
                   <td>{o.hours ? fmtNum(o.hours) + " h" : "—"}</td>
                   <td>{o.quantity ? `${fmtNum(o.quantity)} ${o.unit}` : "—"}</td>
-                  <td>{operatorName(o.operator_id)}</td>
-                  {canDelete && <td><button className="iconBtn" onClick={() => onDelete(o.id)} title="Excluir"><Trash2 size={14} /></button></td>}
+                  <td>{o._pending ? "você (offline)" : operatorName(o.operator_id)}</td>
+                  {canDelete && <td>{!o._pending && <button className="iconBtn" onClick={() => onDelete(o.id)} title="Excluir"><Trash2 size={14} /></button>}</td>}
                 </tr>
               );
             })}
@@ -1008,9 +1205,9 @@ function Historico({ farms, retiros, fields, operations, profiles, currentUser, 
 /* ---------------- CADASTRO ---------------- */
 
 function Cadastro({
-  farms, retiros, fields, machines, opTypesRows, opMeta, enabledOpTypes, users, currentUser,
+  farms, retiros, fields, machines, opTypesRows, opMeta, users, currentUser,
   onAddFarm, onRemoveFarm, onAddRetiro, onRemoveRetiro, onRemoveField, onImportKml,
-  onAddMachine, onRemoveMachine, onToggleOpType, onAddCustomOpType, onRemoveCustomOpType,
+  onAddMachine, onRemoveMachine, onAddCustomOpType,
   onAddUser, onRemoveUser,
 }) {
   const [newFarm, setNewFarm] = useState("");
@@ -1026,6 +1223,7 @@ function Cadastro({
   const [userUsername, setUserUsername] = useState("");
   const [userPassword, setUserPassword] = useState("");
   const [userRole, setUserRole] = useState("operador");
+  const [userFarmIds, setUserFarmIds] = useState([]);
   const [userError, setUserError] = useState("");
   const [userBusy, setUserBusy] = useState(false);
 
@@ -1062,26 +1260,27 @@ function Cadastro({
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
+  function toggleUserFarm(farmId) {
+    setUserFarmIds(prev => prev.includes(farmId) ? prev.filter(id => id !== farmId) : [...prev, farmId]);
+  }
   async function handleAddUser() {
     setUserError("");
     if (!userName.trim() || !userUsername.trim() || !userPassword) { setUserError("Preencha todos os campos."); return; }
+    if (userRole !== "gestor" && userFarmIds.length === 0) { setUserError("Selecione pelo menos uma fazenda para liberar o acesso desse usuário."); return; }
     setUserBusy(true);
-    const err = await onAddUser({ name: userName.trim(), username: userUsername.trim(), password: userPassword, role: userRole });
+    const err = await onAddUser({ name: userName.trim(), username: userUsername.trim(), password: userPassword, role: userRole, farmIds: userRole === "gestor" ? [] : userFarmIds });
     setUserBusy(false);
     if (err) { setUserError(err); return; }
-    setUserName(""); setUserUsername(""); setUserPassword(""); setUserRole("operador");
+    setUserName(""); setUserUsername(""); setUserPassword(""); setUserRole("operador"); setUserFarmIds([]);
   }
   async function handleRemoveUser(id) { const err = await onRemoveUser(id); if (err) setUserError(err); }
 
-  async function handleToggleOpType(key) { const err = await onToggleOpType(key); if (err) setOpTypeError(err); else setOpTypeError(""); }
   async function handleAddCustomOpType() {
     const name = newOpTypeName.trim();
     if (!name) return;
     const err = await onAddCustomOpType(name);
     if (err) setOpTypeError(err); else { setOpTypeError(""); setNewOpTypeName(""); }
   }
-  async function handleRemoveCustomOpType(key) { const err = await onRemoveCustomOpType(key); if (err) setOpTypeError(err); else setOpTypeError(""); }
-
   async function handleAddMachine() { if (!newMachine.trim()) return; await onAddMachine(newMachine.trim()); setNewMachine(""); }
 
   return (
@@ -1134,7 +1333,7 @@ function Cadastro({
 
       <section className="panel kmlPanel">
         <div className="panelHead"><h2>Importar polígonos (KML)</h2></div>
-        <p className="kmlHint">Este é o único jeito de cadastrar talhões. Envie um arquivo .kml com os polígonos — cada Placemark vira um talhão dentro do retiro escolhido, já com a área calculada a partir do polígono.</p>
+        <p className="kmlHint">Este é o único jeito de cadastrar talhões. Envie um arquivo .kml — cada Placemark vira um talhão dentro do retiro escolhido, já com a área calculada a partir do polígono.</p>
         <div className="kmlControls">
           <select value={kmlFarmId} onChange={e => setKmlFarmId(e.target.value)} disabled={!farms.length}>
             {farms.length === 0 && <option value="">Cadastre uma fazenda primeiro</option>}
@@ -1154,23 +1353,17 @@ function Cadastro({
 
       <section className="panel">
         <div className="panelHead"><h2>Operações</h2></div>
-        <p className="kmlHint">Escolha quais tipos de operação ficam disponíveis para lançamento e para os filtros do Painel, ou cadastre um novo tipo.</p>
-        <div className="opTypeRow">
-          {opTypesRows.map(row => {
-            const meta = opMeta[row.key];
-            if (!meta) return null;
-            const Icon = meta.icon;
-            const active = enabledOpTypes.includes(row.key);
-            return (
-              <span key={row.key} className="opTypeToggleWrap">
-                <button type="button" className={"opStamp" + (active ? " active" : "")} style={{ "--stamp-color": meta.color }} onClick={() => handleToggleOpType(row.key)}>
-                  <Icon size={16} />{meta.label}{active ? " · Ativo" : " · Inativo"}
-                </button>
-                {meta.custom && <button type="button" className="iconBtn opTypeRemove" onClick={() => handleRemoveCustomOpType(row.key)} title="Remover operação"><Trash2 size={13} /></button>}
-              </span>
-            );
-          })}
-        </div>
+        <p className="kmlHint">O sistema não vem com nenhuma operação pronta — cadastre abaixo os tipos que sua equipe usa (ex: Plantio, Colheita, Pulverização, Irrigação). Elas ficam disponíveis para lançamento e para os filtros do Painel.</p>
+        {Object.keys(opMeta).length > 0 ? (
+          <div className="opTypeRow">
+            {Object.entries(opMeta).map(([key, meta]) => {
+              const Icon = meta.icon;
+              return <span key={key} className="opStamp opStampStatic" style={{ "--stamp-color": meta.color }}><Icon size={16} />{meta.label}</span>;
+            })}
+          </div>
+        ) : (
+          <p className="mapTip">Nenhuma operação cadastrada ainda.</p>
+        )}
         <div className="inlineForm opTypeAddForm">
           <input type="text" placeholder="Nome da nova operação (ex: Irrigação)" value={newOpTypeName} onChange={e => setNewOpTypeName(e.target.value)} onKeyDown={e => e.key === "Enter" && handleAddCustomOpType()} />
           <button className="btnPrimary" type="button" onClick={handleAddCustomOpType}><Plus size={15} /> Adicionar operação</button>
@@ -1193,7 +1386,7 @@ function Cadastro({
 
       <section className="panel kmlPanel">
         <div className="panelHead"><h2><Users size={15} style={{ marginRight: 6, verticalAlign: -2 }} />Usuários</h2></div>
-        <p className="kmlHint">Cada usuário entra com seu próprio usuário e senha, criado por aqui através de uma função segura no servidor. Operadores lançam operações e veem os relatórios; Administradores cadastram tudo e veem os relatórios; Supervisores só visualizam o Painel.</p>
+        <p className="kmlHint">Cada usuário entra com seu próprio usuário e senha. Operadores lançam operações e veem os relatórios; Administradores cadastram tudo e veem os relatórios (de todas as fazendas); Supervisores só visualizam o Painel. Para Operador e Supervisor, escolha a quais fazendas o acesso será liberado.</p>
         <div className="inlineForm">
           <input type="text" placeholder="Nome completo" value={userName} onChange={e => setUserName(e.target.value)} />
           <input type="text" placeholder="Usuário" value={userUsername} onChange={e => setUserUsername(e.target.value)} />
@@ -1205,13 +1398,33 @@ function Cadastro({
           </select>
           <button className="btnPrimary" type="button" onClick={handleAddUser} disabled={userBusy}><Plus size={15} /> {userBusy ? "Criando…" : "Adicionar"}</button>
         </div>
+        {userRole !== "gestor" && (
+          <div className="userFarmPicker">
+            <span className="filterLabel">Fazendas liberadas para este usuário</span>
+            <div className="userFarmChecks">
+              {farms.length === 0 && <span className="emptyRow">Cadastre uma fazenda primeiro.</span>}
+              {farms.map(f => (
+                <label key={f.id} className="userFarmCheck">
+                  <input type="checkbox" checked={userFarmIds.includes(f.id)} onChange={() => toggleUserFarm(f.id)} />
+                  {f.name}
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
         {userError && <div className="authError userFormError">{userError}</div>}
         <ul className="listRows">
           {users.map(u => {
             const roleMeta = ROLE_META[u.role] || ROLE_META.operador;
+            const farmNames = u.role !== "gestor" ? (u.farm_ids || []).map(id => farms.find(f => f.id === id)?.name).filter(Boolean) : [];
             return (
               <li key={u.id}>
-                <span>{u.name} <em>· @{u.username}</em><span className="rolePill inlinePill" style={{ "--role-color": roleMeta.color }}>{roleMeta.label}</span>{u.id === currentUser.id && <span className="youTag">você</span>}</span>
+                <span>
+                  {u.name} <em>· @{u.username}</em>
+                  <span className="rolePill inlinePill" style={{ "--role-color": roleMeta.color }}>{roleMeta.label}</span>
+                  {u.id === currentUser.id && <span className="youTag">você</span>}
+                  {u.role !== "gestor" && <em className="userFarmList"> · {farmNames.length ? farmNames.join(", ") : "nenhuma fazenda liberada"}</em>}
+                </span>
                 <button className="iconBtn" onClick={() => handleRemoveUser(u.id)} title="Remover usuário"><Trash2 size={14} /></button>
               </li>
             );
@@ -1226,7 +1439,7 @@ function Cadastro({
 function EmptyState({ title, text, actionLabel, onAction }) {
   return (
     <div className="emptyState">
-      <div className="emptyGlyph"><Layers size={22} /></div>
+      <div className="emptyGlyph"><ClipboardList size={22} /></div>
       <h3>{title}</h3><p>{text}</p>
       {actionLabel && <button className="btnPrimary" onClick={onAction}>{actionLabel} <ChevronRight size={15} /></button>}
     </div>
@@ -1251,6 +1464,12 @@ function Style() {
       .spin { animation: spin 1s linear infinite; }
       @keyframes spin { to { transform: rotate(360deg); } }
 
+      .offlineBanner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: rgba(201,162,39,0.18); color: #F3E3B0; font-size: 12px; padding: 8px 20px; border-bottom: 1px solid var(--line); }
+      .offlineBanner.offline { background: rgba(168,92,54,0.22); color: #F3D8C6; }
+      .offlineSyncBtn { margin-left: 6px; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); color: inherit; font-size: 11px; padding: 3px 9px; border-radius: 5px; cursor: pointer; }
+      .offlineSyncBtn:hover { background: rgba(255,255,255,0.25); }
+      .pendingRow { opacity: 0.7; font-style: italic; }
+
       .authWrap { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px 20px; background: radial-gradient(circle at 30% 20%, rgba(79,121,66,0.18), transparent 55%), var(--soil-dark); }
       .authCard { background: var(--paper); border-radius: 10px; padding: 28px 26px; width: 100%; max-width: 340px; text-align: center; }
       .authBrandMark { margin: 0 auto 14px; }
@@ -1268,9 +1487,6 @@ function Style() {
       .brandMark { width: 34px; height: 34px; border-radius: 7px; background: var(--green); display: flex; align-items: center; justify-content: center; color: var(--cream); flex-shrink: 0; }
       .brandTitle { font-family: 'Bitter', serif; font-weight: 700; font-size: 17px; letter-spacing: 0.2px; }
       .brandSub { font-size: 11.5px; color: rgba(246,240,228,0.55); margin-top: 1px; }
-      .farmSelect { display: flex; align-items: center; gap: 6px; background: var(--soil-mid); border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; color: var(--cream); }
-      .farmSelect select { background: transparent; border: none; color: var(--cream); font-size: 12.5px; font-family: 'Inter', sans-serif; outline: none; }
-      .farmSelect select option { color: var(--ink); }
       .userBadge { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--cream); }
       .userName { font-weight: 500; }
       .rolePill { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; padding: 2px 7px; border-radius: 20px; background: color-mix(in srgb, var(--role-color) 30%, transparent); color: var(--role-color); }
@@ -1303,6 +1519,9 @@ function Style() {
 
       .filterPanel { padding-bottom: 12px; }
       .filterClear { background: none; border: none; color: var(--ink-soft); font-size: 11px; text-decoration: underline; cursor: pointer; font-family: 'Inter', sans-serif; }
+      .chartModeRow { display: flex; gap: 4px; }
+      .chartModeBtn { font-size: 11px; font-weight: 500; padding: 4px 10px; border-radius: 20px; border: 1px solid rgba(36,27,20,0.15); background: var(--cream); color: var(--ink-soft); cursor: pointer; font-family: 'Inter', sans-serif; }
+      .chartModeBtn.active { background: var(--green); color: var(--cream); border-color: var(--green); font-weight: 600; }
       .filterRow { display: flex; flex-wrap: wrap; gap: 16px 24px; }
       .filterGroup { display: flex; flex-direction: column; gap: 6px; }
       .filterLabel { font-size: 10.5px; font-weight: 600; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.3px; }
@@ -1327,8 +1546,8 @@ function Style() {
       .mapZoomBtn { width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; background: transparent; color: rgba(255,255,255,0.85); border: none; border-radius: 5px; cursor: pointer; padding: 0; transition: background 0.15s ease, color 0.15s ease; }
       .mapZoomBtn:hover { background: rgba(255,255,255,0.16); color: #fff; }
       .farmSvgMap { width: 100%; height: auto; display: block; background: #38301f; }
-      .farmSvgMap.draggable { cursor: grab; }
-      .farmSvgMap.dragging { cursor: grabbing; user-select: none; }
+      .farmSvgMap.draggable { cursor: grab; touch-action: none; }
+      .farmSvgMap.dragging { cursor: grabbing; user-select: none; touch-action: none; }
       .mapFieldName { font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 700; fill: #ffffff; paint-order: stroke; stroke: rgba(0,0,0,0.75); stroke-width: 3px; stroke-linejoin: round; }
       .mapFieldSub { font-family: 'IBM Plex Mono', monospace; font-size: 9px; fill: #ffffff; paint-order: stroke; stroke: rgba(0,0,0,0.75); stroke-width: 3px; stroke-linejoin: round; }
       .mapAttribution { position: absolute; right: 8px; bottom: 6px; font-size: 8px; color: rgba(255,255,255,0.75); background: rgba(20,16,10,0.45); backdrop-filter: blur(2px); padding: 2px 6px; border-radius: 4px; pointer-events: none; }
@@ -1351,11 +1570,8 @@ function Style() {
 
       .formPanel { max-width: 720px; }
       .opTypeRow { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
-      .opStamp { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 7px; border: 1.5px solid rgba(36,27,20,0.15); background: transparent; color: var(--ink); font-size: 12px; font-weight: 500; cursor: pointer; font-family: 'Inter', sans-serif; }
-      .opStamp.active { border-color: var(--stamp-color); background: color-mix(in srgb, var(--stamp-color) 14%, transparent); color: var(--ink); font-weight: 600; }
-      .opTypeToggleWrap { display: inline-flex; align-items: center; gap: 2px; }
-      .opTypeRemove { color: var(--ink-soft); }
-      .opTypeRemove:hover { color: var(--rust); background: rgba(168,92,54,0.1); }
+      .opStamp { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 7px; border: 1.5px solid rgba(36,27,20,0.15); background: transparent; color: var(--ink); font-size: 12px; font-weight: 500; font-family: 'Inter', sans-serif; }
+      .opStampStatic { cursor: default; border-color: var(--stamp-color); background: color-mix(in srgb, var(--stamp-color) 14%, transparent); font-weight: 600; }
       .opTypeAddForm { margin-top: 4px; margin-bottom: 0; }
 
       .formGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -1375,7 +1591,8 @@ function Style() {
       .iconBtn { background: transparent; border: none; color: var(--ink-soft); cursor: pointer; padding: 4px; border-radius: 4px; }
       .iconBtn:hover { color: var(--rust); background: rgba(168,92,54,0.1); }
       .tableEmpty { padding: 20px; text-align: center; color: var(--ink-soft); font-size: 12.5px; }
-      .histFilters { display: flex; gap: 8px; }
+      .histFilters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .exportBtn { padding: 7px 12px; font-size: 11.5px; }
       .histFilters select { font-size: 11.5px; padding: 5px 7px; border-radius: 6px; border: 1px solid rgba(36,27,20,0.15); background: var(--cream); color: var(--ink); }
 
       .cadastroGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; align-items: start; }
@@ -1385,6 +1602,10 @@ function Style() {
       .kmlControls select { font-size: 12.5px; padding: 8px 9px; border-radius: 6px; border: 1px solid rgba(36,27,20,0.15); background: var(--cream); color: var(--ink); }
       .kmlMsg { margin-top: 10px; font-size: 12px; color: var(--ink); background: rgba(79,121,66,0.12); border-radius: 6px; padding: 8px 10px; }
       .userFormError { margin-bottom: 10px; }
+      .userFarmPicker { margin: 2px 0 12px; }
+      .userFarmChecks { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; }
+      .userFarmCheck { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink); background: var(--cream); padding: 5px 9px; border-radius: 6px; cursor: pointer; }
+      .userFarmList { font-style: normal; color: var(--ink-soft); }
 
       .inlineForm { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
       .inlineForm input, .inlineForm select { font-family: 'Inter', sans-serif; font-size: 12.5px; padding: 8px 9px; border-radius: 6px; border: 1px solid rgba(36,27,20,0.15); background: var(--cream); color: var(--ink); flex: 1; min-width: 110px; }

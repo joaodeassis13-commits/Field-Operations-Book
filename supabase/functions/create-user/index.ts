@@ -16,9 +16,15 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
-    const { username, name, password, role } = await req.json();
+    const { username, name, password, role, farmIds } = await req.json();
     if (!username || !name || !password || !["operador", "gestor", "supervisor"].includes(role)) {
       return new Response(JSON.stringify({ error: "Dados inválidos." }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    if (role !== "gestor" && (!Array.isArray(farmIds) || farmIds.length === 0)) {
+      return new Response(JSON.stringify({ error: "Selecione pelo menos uma fazenda para liberar o acesso desse usuário." }), {
         status: 400,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
@@ -73,6 +79,7 @@ Deno.serve(async (req) => {
       username: String(username).trim(),
       name: String(name).trim(),
       role,
+      farm_ids: role === "gestor" ? [] : farmIds,
     });
     if (profileError) {
       return new Response(JSON.stringify({ error: profileError.message }), {

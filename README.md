@@ -1,9 +1,9 @@
 # Field Operations Book — versão standalone
 
-App para registro diário de operações a campo (preparo de solo, plantio, pulverização,
-colheita), com KPIs de eficiência, mapa real dos talhões (importado de KML) e login
-por usuário com dois perfis: **Gestor** (cadastros + relatórios) e **Operador**
-(lançamentos + relatórios).
+App para registro diário de operações a campo, com KPIs de eficiência, mapa real
+dos talhões (importado de KML), controle de acesso por fazenda, três perfis de
+usuário (Administrador, Operador, Supervisor) e **modo offline** para uso no
+campo sem sinal.
 
 Este pacote já vem com o código pronto. Falta só **criar sua conta gratuita no
 Supabase** e **rodar alguns comandos**. Siga a ordem abaixo.
@@ -13,21 +13,34 @@ Supabase** e **rodar alguns comandos**. Siga a ordem abaixo.
 ## Atualizado — o que tem de novo nesta versão
 
 Se você já tinha rodado uma versão anterior deste projeto, **rode o `schema.sql`
-de novo** (ele é seguro de rodar mais de uma vez) para aplicar as mudanças:
+de novo** (ele é seguro de rodar mais de uma vez) e **publique a Edge Function
+`create-user` de novo** (ela mudou), para aplicar as mudanças:
 
-- Hierarquia **Fazenda → Retiro → Talhão** (tabela `retiros` nova).
-- Talhões só são criados via **importação de KML** (sem cadastro manual).
-- Cadastro de **Máquinas**, com seleção obrigatória no lançamento.
-- Tipos de **Operação configuráveis** (ativar/desativar os padrão, criar novos).
-- Novo perfil de usuário **Supervisor** (só visualiza o Painel).
-- Lançamento por **horímetro inicial/final** (horas calculadas automaticamente,
-  com validações: final ≥ inicial e diferença ≤ 24h).
+- **Modo offline**: o app funciona sem internet — os dados das últimas telas
+  ficam salvos no aparelho, e lançamentos feitos sem sinal ficam numa fila local
+  e são enviados automaticamente assim que a conexão voltar (com aviso na tela
+  mostrando o que está pendente).
+- **Acesso por fazenda**: ao criar um usuário Operador ou Supervisor, o
+  Administrador escolhe quais fazendas ele pode ver/usar. Administrador continua
+  vendo tudo.
+- **Sem operações pré-cadastradas**: o sistema não vem mais com "Plantio",
+  "Colheita" etc. prontos — o Administrador cadastra cada tipo de operação do
+  zero, em Cadastro → Operações.
+- Hierarquia **Fazenda → Retiro → Talhão**, com talhões só criados via
+  **importação de KML**.
+- Cadastro de **Máquinas**, com seleção obrigatória no lançamento, e sugestão
+  automática do horímetro inicial com base no último lançamento da máquina.
+  Diferença máxima entre horímetros: **12 horas**.
 - Validação de área trabalhada: nunca pode passar de **110%** da área do talhão.
-- Painel com filtros de Operação, Retiro, Operador e Período, KPIs recalculados
-  (Área no período, Rendimento operacional, Área média/dia, Horas/dia).
-- Mapa de satélite com **zoom, arrastar (pan)** e botões para mostrar/ocultar
-  nome, área e percentual de cada talhão — e aqui, fora do sandbox do Claude,
-  a **foto de satélite real carrega normalmente**.
+- Painel com filtro de **Fazenda** (além de Operação, Retiro, Operador e
+  Período), gráfico "Área trabalhada" com alternância **Dias/Meses**, e KPIs
+  recalculados (Área no período, Rendimento operacional, Área média/dia,
+  Horas/dia).
+- Mapa de satélite com **zoom, arrastar (funciona no toque do celular também)**
+  e botões para mostrar/ocultar nome, área e percentual — sem tons de verde nas
+  cores de operação, para não se confundir com a vegetação da foto.
+- **Exportar Excel**: botão no Histórico que baixa todos os lançamentos em
+  planilha `.xlsx`.
 
 ---
 
