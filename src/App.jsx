@@ -141,6 +141,7 @@ function savePendingOps(list) {
 export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [session, setSession] = useState(null);
+  const [hasAdmin, setHasAdmin] = useState(null);
   const [profile, setProfile] = useState(null);
   const [dataLoading, setDataLoading] = useState(true);
   const [saveError, setSaveError] = useState(null);
@@ -165,6 +166,12 @@ export default function App() {
     const { data: sub } = supabase.auth.onAuthStateChange((_e, sess) => setSession(sess));
     return () => sub.subscription.unsubscribe();
   }, []);
+
+  useEffect(() => {
+    if (session) return; // já logado, não precisa checar
+    if (!navigator.onLine) { setHasAdmin(true); return; } // offline: assume que já existe, evita mostrar "primeiro acesso" à toa
+    supabase.rpc("has_any_gestor").then(({ data, error }) => setHasAdmin(error ? true : !!data));
+  }, [session]);
 
   useEffect(() => {
     if (!session) { setProfile(null); return; }
@@ -391,7 +398,10 @@ export default function App() {
 
   /* ---------- render ---------- */
   if (authLoading) return <Shell><div className="loadingWrap"><Loader2 className="spin" size={28} /><span>Abrindo o Field Operations Book…</span></div><Style /></Shell>;
-  if (!session) return <Shell><LoginOrSetup onLogin={handleLogin} onFirstRunCreate={handleFirstRunCreate} /><Style /></Shell>;
+  if (!session) {
+    if (hasAdmin === null) return <Shell><div className="loadingWrap"><Loader2 className="spin" size={28} /><span>Abrindo o Field Operations Book…</span></div><Style /></Shell>;
+    return <Shell><LoginOrSetup onLogin={handleLogin} onFirstRunCreate={handleFirstRunCreate} hasAdmin={hasAdmin} /><Style /></Shell>;
+  }
   if (!profile || dataLoading) return <Shell><div className="loadingWrap"><Loader2 className="spin" size={28} /><span>Carregando seus dados…</span></div><Style /></Shell>;
 
   const tabs = TABS_BY_ROLE[profile.role] || TABS_BY_ROLE.operador;
@@ -480,8 +490,8 @@ function AuthShell({ title, subtitle, children }) {
   );
 }
 
-function LoginOrSetup({ onLogin, onFirstRunCreate }) {
-  const [mode, setMode] = useState("login");
+function LoginOrSetup({ onLogin, onFirstRunCreate, hasAdmin }) {
+  const [mode, setMode] = useState(hasAdmin ? "login" : "setup");
   const [name, setName] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -510,9 +520,11 @@ function LoginOrSetup({ onLogin, onFirstRunCreate }) {
           <Lock size={15} /> {busy ? "Aguarde…" : mode === "login" ? "Entrar" : "Criar usuário Administrador"}
         </button>
       </div>
-      <button className="authSwitch" type="button" onClick={() => { setMode(mode === "login" ? "setup" : "login"); setError(""); }}>
-        {mode === "login" ? "Primeiro acesso? Criar o usuário Administrador inicial" : "Já tenho usuário — voltar ao login"}
-      </button>
+      {!hasAdmin && (
+        <button className="authSwitch" type="button" onClick={() => { setMode(mode === "login" ? "setup" : "login"); setError(""); }}>
+          {mode === "login" ? "Primeiro acesso? Criar o usuário Administrador inicial" : "Já tenho usuário — voltar ao login"}
+        </button>
+      )}
     </AuthShell>
   );
 }

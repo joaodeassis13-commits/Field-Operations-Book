@@ -108,6 +108,18 @@ as $$
 $$;
 grant execute on function public.get_email_by_username(text) to anon, authenticated;
 
+-- diz pro app se já existe algum Administrador, pra esconder a opção de
+-- "criar usuário Administrador inicial" fora da primeiríssima configuração.
+create or replace function public.has_any_gestor()
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (select 1 from public.profiles where role = 'gestor');
+$$;
+grant execute on function public.has_any_gestor() to anon, authenticated;
+
 create or replace function public.is_gestor()
 returns boolean
 language sql
