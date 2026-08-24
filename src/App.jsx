@@ -381,7 +381,16 @@ export default function App() {
   }
   async function addUser({ name, username, password, role, farmIds }) {
     const { data, error } = await supabase.functions.invoke("create-user", { body: { name, username, password, role, farmIds } });
-    if (error) return error.message || "Não foi possível criar o usuário.";
+    if (error) {
+      let msg = error.message || "Não foi possível criar o usuário.";
+      try {
+        if (error.context && typeof error.context.json === "function") {
+          const body = await error.context.json();
+          if (body?.error) msg = body.error;
+        }
+      } catch (e) { /* mantém a mensagem genérica se não der pra ler o corpo */ }
+      return msg;
+    }
     if (data?.error) return data.error;
     await fetchAll();
     return null;
@@ -1279,6 +1288,8 @@ function Cadastro({
     setUserError("");
     if (!userName.trim() || !userUsername.trim() || !userPassword) { setUserError("Preencha todos os campos."); return; }
     if (userRole !== "gestor" && userFarmIds.length === 0) { setUserError("Selecione pelo menos uma fazenda para liberar o acesso desse usuário."); return; }
+    const dup = users.some(u => (u.username || "").trim().toLowerCase() === userUsername.trim().toLowerCase());
+    if (dup) { setUserError("Já existe um usuário com esse nome de acesso."); return; }
     setUserBusy(true);
     const err = await onAddUser({ name: userName.trim(), username: userUsername.trim(), password: userPassword, role: userRole, farmIds: userRole === "gestor" ? [] : userFarmIds });
     setUserBusy(false);
