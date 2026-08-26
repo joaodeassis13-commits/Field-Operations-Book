@@ -526,11 +526,15 @@ function OfflineBanner({ isOnline, pendingCount, syncing, usingCache, onSyncNow 
 function AuthShell({ title, subtitle, children }) {
   return (
     <div className="authWrap">
+      <img src="/icons/icon-512.png" alt="" className="authBrandImg" aria-hidden="true" />
+      <h2 className="authTitle">{title}</h2>
+      <p className="authSub">{subtitle}</p>
       <div className="authCard">
-        <div className="brandMark authBrandMark" aria-hidden="true"><SproutIcon size={20} strokeWidth={2.25} /></div>
-        <h2>{title}</h2>
-        <p className="authSub">{subtitle}</p>
         {children}
+      </div>
+      <div className="authFooterWrap">
+        <div className="authFooterLabel">Uma solução criada por</div>
+        <img src="/visao-agropecuaria-logo.png" alt="Visão Agropecuária" className="authFooterLogo" />
       </div>
     </div>
   );
@@ -991,7 +995,7 @@ function FarmPolygonMap({ fields, operations, opMeta }) {
           ) : (
             <><rect x={0} y={0} width={width} height={height} fill="url(#soilFallback)" /><rect x={0} y={0} width={width} height={height} fill="url(#soilFallbackShade)" /></>
           )}
-          {items.map(({ field, d, meta }) => <path key={field.id + "-base"} d={d} fill={meta ? hexA(meta.color, 0.28) : "rgba(255,255,255,0.06)"} stroke="rgba(255,255,255,0.85)" strokeWidth={0.7} strokeLinejoin="round" />)}
+          {items.map(({ field, d, meta }) => <path key={field.id + "-base"} d={d} fill={meta ? hexA(meta.color, 0.28) : "rgba(255,255,255,0.3)"} stroke="rgba(255,255,255,0.85)" strokeWidth={0.7} strokeLinejoin="round" />)}
           {items.map(({ field, d, meta, pct }) => meta && pct > 0 ? <path key={field.id + "-fill"} d={d} fill={hexA(meta.color, 0.8)} clipPath={`url(#clip-${field.id})`} pointerEvents="none" /> : null)}
           {items.map(({ field, d }) => <path key={field.id + "-outline"} d={d} fill="none" stroke="rgba(255,255,255,0.9)" strokeWidth={0.7} strokeLinejoin="round" />)}
           {items.map(({ field, centroid, meta, pct }) => {
@@ -1535,15 +1539,22 @@ function Style() {
       .offlineSyncBtn:hover { background: rgba(255,255,255,0.25); }
       .pendingRow { opacity: 0.7; font-style: italic; }
 
-      .authWrap { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px 20px; background: radial-gradient(circle at 30% 20%, rgba(79,121,66,0.18), transparent 55%), var(--soil-dark); }
-      .authCard { background: var(--paper); border-radius: 10px; padding: 28px 26px; width: 100%; max-width: 340px; text-align: center; }
-      .authBrandMark { margin: 0 auto 14px; }
-      .authCard h2 { font-family: 'Bitter', serif; font-size: 18px; color: var(--ink); margin: 0 0 6px; }
-      .authSub { font-size: 12px; color: var(--ink-soft); margin: 0 0 18px; }
+      .authWrap { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px 32px; background: #EAEFE6; }
+      .authBrandImg { width: 80px; height: 80px; border-radius: 20px; object-fit: cover; display: block; box-shadow: 0 6px 16px rgba(36,27,20,0.18); }
+      .authTitle { font-family: 'Bitter', serif; font-weight: 700; font-size: 24px; color: #1B4332; margin: 16px 0 4px; text-align: center; }
+      .authSub { font-size: 13px; color: #66756A; margin: 0 0 26px; text-align: center; }
+      .authCard { background: #FFFFFF; border-radius: 14px; padding: 28px 26px; width: 100%; max-width: 360px; text-align: center; box-shadow: 0 8px 24px rgba(27,67,50,0.08); }
       .authForm { display: flex; flex-direction: column; gap: 12px; text-align: left; }
+      .authCard .fieldLabel span { color: #4A5A4C; }
+      .authCard .fieldLabel input { background: #FBFCFA; border: 1px solid #D9E0D6; color: #1B4332; }
+      .authCard .fieldLabel input:focus { border-color: #1B4332; }
       .authError { font-size: 11.5px; color: var(--rust); background: rgba(168,92,54,0.12); padding: 7px 9px; border-radius: 6px; }
-      .authSubmit { justify-content: center; margin-top: 4px; }
-      .authSwitch { margin-top: 14px; background: none; border: none; color: var(--ink-soft); font-size: 11px; text-decoration: underline; cursor: pointer; font-family: 'Inter', sans-serif; }
+      .authSubmit { justify-content: center; margin-top: 4px; background: #1B4332; }
+      .authSubmit:hover { background: #163829; }
+      .authSwitch { margin-top: 14px; background: none; border: none; color: #7C8A7E; font-size: 11px; text-decoration: underline; cursor: pointer; font-family: 'Inter', sans-serif; }
+      .authFooterWrap { margin-top: 44px; text-align: center; }
+      .authFooterLabel { font-size: 10.5px; color: #92A08F; margin-bottom: 8px; }
+      .authFooterLogo { height: 34px; width: auto; opacity: 0.9; }
 
       .header { background: var(--soil-dark); padding: 18px 20px 0; border-bottom: 1px solid var(--line); }
       .headerTop { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
