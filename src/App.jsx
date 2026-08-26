@@ -69,6 +69,15 @@ function fieldProgress(field, ops, opMeta) {
   return { last, meta, pct };
 }
 function usernameToEmail(username) { return `${String(username).trim().toLowerCase()}@fieldbook.local`; }
+function useIsDesktop(breakpoint = 768) {
+  const [isDesktop, setIsDesktop] = useState(() => (typeof window !== "undefined" ? window.innerWidth >= breakpoint : true));
+  useEffect(() => {
+    function onResize() { setIsDesktop(window.innerWidth >= breakpoint); }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [breakpoint]);
+  return isDesktop;
+}
 
 /* --------- KML --------- */
 function parseKML(text) {
@@ -146,6 +155,7 @@ export default function App() {
   const [dataLoading, setDataLoading] = useState(true);
   const [saveError, setSaveError] = useState(null);
   const [usingCache, setUsingCache] = useState(false);
+  const [profileTimedOut, setProfileTimedOut] = useState(false);
 
   const [farms, setFarms] = useState([]);
   const [retiros, setRetiros] = useState([]);
@@ -175,8 +185,22 @@ export default function App() {
 
   useEffect(() => {
     if (!session) { setProfile(null); return; }
-    supabase.from("profiles").select("*").eq("id", session.user.id).single().then(({ data }) => setProfile(data || null));
+    function useCachedProfile() {
+      const cache = loadRefCache();
+      const cached = (cache?.profiles || []).find(p => p.id === session.user.id);
+      if (cached) setProfile(cached);
+    }
+    if (!navigator.onLine) { useCachedProfile(); return; }
+    supabase.from("profiles").select("*").eq("id", session.user.id).single()
+      .then(({ data }) => { if (data) setProfile(data); else useCachedProfile(); })
+      .catch(() => useCachedProfile());
   }, [session]);
+
+  useEffect(() => {
+    if (!session || (profile && !dataLoading)) { setProfileTimedOut(false); return; }
+    const t = setTimeout(() => setProfileTimedOut(true), 6000);
+    return () => clearTimeout(t);
+  }, [session, profile, dataLoading]);
 
   /* ---------- online/offline ---------- */
   useEffect(() => {
@@ -381,7 +405,16 @@ export default function App() {
   }
   async function addUser({ name, username, password, role, farmIds }) {
     const { data, error } = await supabase.functions.invoke("create-user", { body: { name, username, password, role, farmIds } });
-    if (error) return error.message || "Não foi possível criar o usuário.";
+    if (error) {
+      let msg = error.message || "Não foi possível criar o usuário.";
+      try {
+        if (error.context && typeof error.context.json === "function") {
+          const body = await error.context.json();
+          if (body?.error) msg = body.error;
+        }
+      } catch (e) { /* mantém a mensagem genérica se não der pra ler o corpo */ }
+      return msg;
+    }
     if (data?.error) return data.error;
     await fetchAll();
     return null;
@@ -402,7 +435,20 @@ export default function App() {
     if (hasAdmin === null) return <Shell><div className="loadingWrap"><Loader2 className="spin" size={28} /><span>Abrindo o Field Operations Book…</span></div><Style /></Shell>;
     return <Shell><LoginOrSetup onLogin={handleLogin} onFirstRunCreate={handleFirstRunCreate} hasAdmin={hasAdmin} /><Style /></Shell>;
   }
-  if (!profile || dataLoading) return <Shell><div className="loadingWrap"><Loader2 className="spin" size={28} /><span>Carregando seus dados…</span></div><Style /></Shell>;
+  if (!profile || dataLoading) {
+    if (profileTimedOut) {
+      return (
+        <Shell>
+          <div className="loadingWrap" style={{ flexDirection: "column", gap: 6, textAlign: "center" }}>
+            <span>Não foi possível carregar seus dados agora.</span>
+            <span style={{ fontSize: 12, opacity: 0.7 }}>{!navigator.onLine ? "Você está sem conexão e este aparelho ainda não tem dados salvos de uma vez anterior. Conecte à internet uma vez para carregar os dados iniciais." : "Verifique sua conexão e tente novamente."}</span>
+          </div>
+          <Style />
+        </Shell>
+      );
+    }
+    return <Shell><div className="loadingWrap"><Loader2 className="spin" size={28} /><span>Carregando seus dados…</span></div><Style /></Shell>;
+  }
 
   const tabs = TABS_BY_ROLE[profile.role] || TABS_BY_ROLE.operador;
   const opMeta = buildOpMeta(opTypesRows);
@@ -561,6 +607,7 @@ function Header({ tab, setTab, tabs, currentUser, onLogout }) {
 /* ---------------- PAINEL ---------------- */
 
 function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFields, enabledOpTypes, opMeta, goCadastro, goLancamento, canGoCadastro }) {
+  const isDesktop = useIsDesktop();
   const [farmFilter, setFarmFilter] = useState("all");
   const [operFilter, setOperFilter] = useState("all");
   const [retiroFilter, setRetiroFilter] = useState("all");
@@ -758,26 +805,30 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
         </div>
       </section>
 
-      <section className="panel">
-        <div className="panelHead"><h2>Mapa das fazendas</h2></div>
-        <MapLegend enabledOpTypes={enabledOpTypes} opMeta={opMeta} />
-        {mapFields.length > 0 ? (
-          <div className="farmMapGroup">
-            <div className="farmMapLabel">{mapHeading}</div>
-            {mapSubheading && <div className="subGroupLabel">{mapSubheading}</div>}
-            {mapPolyFields.length > 0 && <FarmPolygonMap fields={mapPolyFields} operations={filteredOperations} opMeta={opMeta} />}
-            {mapPlainFields.length > 0 && (
-              <>
-                {mapPolyFields.length > 0 && <div className="subGroupLabel">Sem polígono importado</div>}
-                <div className="fieldGrid">{mapPlainFields.map(field => <FieldTile key={field.id} field={field} operations={filteredOperations.filter(o => o.field_id === field.id)} opMeta={opMeta} />)}</div>
-              </>
-            )}
-          </div>
-        ) : (
-          <p className="mapTip">Nenhum talhão encontrado para os filtros atuais.</p>
-        )}
-        {!anyPolygon && <p className="mapTip">{canGoCadastro ? <>Dica: importe um arquivo KML com os polígonos dos talhões na aba <strong>Cadastro</strong>.</> : "Ainda não há polígonos importados para essas fazendas."}</p>}
-      </section>
+      {isDesktop ? (
+        <section className="panel">
+          <div className="panelHead"><h2>Mapa das fazendas</h2></div>
+          <MapLegend enabledOpTypes={enabledOpTypes} opMeta={opMeta} />
+          {mapFields.length > 0 ? (
+            <div className="farmMapGroup">
+              <div className="farmMapLabel">{mapHeading}</div>
+              {mapSubheading && <div className="subGroupLabel">{mapSubheading}</div>}
+              {mapPolyFields.length > 0 && <FarmPolygonMap fields={mapPolyFields} operations={filteredOperations} opMeta={opMeta} />}
+              {mapPlainFields.length > 0 && (
+                <>
+                  {mapPolyFields.length > 0 && <div className="subGroupLabel">Sem polígono importado</div>}
+                  <div className="fieldGrid">{mapPlainFields.map(field => <FieldTile key={field.id} field={field} operations={filteredOperations.filter(o => o.field_id === field.id)} opMeta={opMeta} />)}</div>
+                </>
+              )}
+            </div>
+          ) : (
+            <p className="mapTip">Nenhum talhão encontrado para os filtros atuais.</p>
+          )}
+          {!anyPolygon && <p className="mapTip">{canGoCadastro ? <>Dica: importe um arquivo KML com os polígonos dos talhões na aba <strong>Cadastro</strong>.</> : "Ainda não há polígonos importados para essas fazendas."}</p>}
+        </section>
+      ) : (
+        <p className="mapMobileNotice">O mapa das fazendas está disponível na versão para computador — no celular, veja os indicadores e o gráfico acima.</p>
+      )}
 
       {goLancamento && <div className="quickAdd"><button className="btnPrimary" onClick={goLancamento}><Plus size={16} /> Novo lançamento</button></div>}
     </div>
@@ -1279,6 +1330,8 @@ function Cadastro({
     setUserError("");
     if (!userName.trim() || !userUsername.trim() || !userPassword) { setUserError("Preencha todos os campos."); return; }
     if (userRole !== "gestor" && userFarmIds.length === 0) { setUserError("Selecione pelo menos uma fazenda para liberar o acesso desse usuário."); return; }
+    const dup = users.some(u => (u.username || "").trim().toLowerCase() === userUsername.trim().toLowerCase());
+    if (dup) { setUserError("Já existe um usuário com esse nome de acesso."); return; }
     setUserBusy(true);
     const err = await onAddUser({ name: userName.trim(), username: userUsername.trim(), password: userPassword, role: userRole, farmIds: userRole === "gestor" ? [] : userFarmIds });
     setUserBusy(false);
@@ -1631,6 +1684,8 @@ function Style() {
       .emptyGlyph { width: 42px; height: 42px; border-radius: 50%; background: rgba(79,121,66,0.15); color: var(--green); display: flex; align-items: center; justify-content: center; margin-bottom: 4px; }
       .emptyState h3 { font-family: 'Bitter', serif; font-size: 16px; margin: 0; }
       .emptyState p { font-size: 12.5px; color: var(--ink-soft); max-width: 360px; margin: 0 0 6px; }
+
+      .mapMobileNotice { font-size: 11.5px; color: var(--ink-soft); text-align: center; padding: 4px 10px 0; }
 
       @media (max-width: 480px) {
         .kpiGrid { grid-template-columns: repeat(2, 1fr); }
