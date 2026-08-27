@@ -676,9 +676,24 @@ function Painel({ farms, retiros, fields, operations, profiles, hasFarms, hasFie
   const horasComArea = comHoras.reduce((s, o) => s + Number(o.hours), 0);
   const rendimentoOperacional = horasComArea > 0 ? areaComHoras / horasComArea : null;
   const diasComLancamento = new Set(filteredOperations.map(o => o.date).filter(Boolean)).size;
-  const totalHoras = filteredOperations.reduce((s, o) => s + (Number(o.hours) || 0), 0);
   const areaMediaPorDia = diasComLancamento > 0 ? areaPeriodo / diasComLancamento : null;
-  const horasPorDia = diasComLancamento > 0 ? totalHoras / diasComLancamento : null;
+
+  // horas trabalhadas por dia: para cada dia, a média das horas de cada operador naquele dia;
+  // o indicador do período é a média dessas médias diárias (não a soma de todo mundo dividida pelos dias).
+  const hoursByDayOperator = {};
+  filteredOperations.forEach(o => {
+    if (!o.date) return;
+    const opId = o.operator_id || "—";
+    if (!hoursByDayOperator[o.date]) hoursByDayOperator[o.date] = {};
+    hoursByDayOperator[o.date][opId] = (hoursByDayOperator[o.date][opId] || 0) + (Number(o.hours) || 0);
+  });
+  const dailyOperatorAverages = Object.values(hoursByDayOperator).map(operatorHours => {
+    const vals = Object.values(operatorHours);
+    return vals.reduce((s, v) => s + v, 0) / vals.length;
+  });
+  const horasPorDia = dailyOperatorAverages.length > 0
+    ? dailyOperatorAverages.reduce((s, v) => s + v, 0) / dailyOperatorAverages.length
+    : null;
 
   const msPerDay = 24 * 60 * 60 * 1000;
   let chartData = [];
