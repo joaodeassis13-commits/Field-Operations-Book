@@ -50,8 +50,10 @@ alter table public.fields add column if not exists retiro_id uuid references pub
 create table if not exists public.machines (
   id uuid primary key default gen_random_uuid(),
   name text not null,
+  farm_id uuid references public.farms (id) on delete set null, -- fazenda onde a máquina está atualmente (vazio = disponível em qualquer fazenda)
   created_at timestamptz not null default now()
 );
+alter table public.machines add column if not exists farm_id uuid references public.farms (id) on delete set null;
 
 -- Tipos de operação: o sistema não vem com nenhum pronto — o Administrador cadastra cada um pela aba Cadastro.
 create table if not exists public.op_types (
@@ -200,6 +202,8 @@ drop policy if exists "machines_select_authenticated" on public.machines;
 create policy "machines_select_authenticated" on public.machines for select to authenticated using (true);
 drop policy if exists "machines_write_gestor" on public.machines;
 create policy "machines_write_gestor" on public.machines for insert to authenticated with check (public.is_gestor());
+drop policy if exists "machines_update_gestor" on public.machines;
+create policy "machines_update_gestor" on public.machines for update to authenticated using (public.is_gestor());
 drop policy if exists "machines_delete_gestor" on public.machines;
 create policy "machines_delete_gestor" on public.machines for delete to authenticated using (public.is_gestor());
 

@@ -369,6 +369,10 @@ export default function App() {
     const { error } = await supabase.from("machines").delete().eq("id", id);
     if (error) setSaveError(error.message); else fetchAll();
   }
+  async function updateMachineFarm(id, farmId) {
+    const { error } = await supabase.from("machines").update({ farm_id: farmId || null }).eq("id", id);
+    if (error) setSaveError(error.message); else fetchAll();
+  }
   async function addCustomOpType(name) {
     const dup = opTypesRows.some(r => r.label.trim().toLowerCase() === name.trim().toLowerCase());
     if (dup) return "Já existe uma operação com esse nome.";
@@ -489,7 +493,7 @@ export default function App() {
             onAddFarm={addFarm} onRemoveFarm={removeFarm}
             onAddRetiro={addRetiro} onRemoveRetiro={removeRetiro}
             onRemoveField={removeField} onImportKml={importKml}
-            onAddMachine={addMachine} onRemoveMachine={removeMachine}
+            onAddMachine={addMachine} onRemoveMachine={removeMachine} onUpdateMachineFarm={updateMachineFarm}
             onAddCustomOpType={addCustomOpType}
             onAddUser={addUser} onRemoveUser={removeUser}
           />
@@ -1056,6 +1060,7 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
 
   const retirosOfFarm = (retiros || []).filter(r => r.farm_id === farmId);
   const fieldsOfRetiro = fields.filter(f => f.retiro_id === retiroId);
+  const machinesForFarm = (machines || []).filter(m => !m.farm_id || m.farm_id === farmId);
 
   const horIniNum = horIni === "" ? null : parseFloat(horIni);
   const horFimNum = horFim === "" ? null : parseFloat(horFim);
@@ -1076,7 +1081,7 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
   useEffect(() => { if (!retirosOfFarm.find(r => r.id === retiroId)) setRetiroId(""); /* eslint-disable-next-line */ }, [farmId, retiros && retiros.length]);
   useEffect(() => { if (!fieldsOfRetiro.find(f => f.id === fieldId)) setFieldId(""); /* eslint-disable-next-line */ }, [retiroId, fields.length]);
   useEffect(() => { if (opType && !opTypeList.find(([key]) => key === opType)) setOpType(""); /* eslint-disable-next-line */ }, [enabledOpTypes.join(",")]);
-  useEffect(() => { if (machineId && !(machines || []).find(m => m.id === machineId)) setMachineId(""); /* eslint-disable-next-line */ }, [machines && machines.length]);
+  useEffect(() => { if (machineId && !machinesForFarm.find(m => m.id === machineId)) setMachineId(""); /* eslint-disable-next-line */ }, [farmId, machines && machines.length]);
 
   // sugere o horímetro inicial a partir do último horímetro final lançado para a máquina escolhida
   useEffect(() => {
@@ -1092,7 +1097,7 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
 
   if (!hasFarms || !hasFields) return <EmptyState title={!hasFarms ? "Nenhuma fazenda cadastrada" : "Nenhum talhão cadastrado"} text="Peça a um Administrador para cadastrar pelo menos uma fazenda, um retiro e um talhão antes de lançar operações." />;
 
-  const selectedMachine = (machines || []).find(m => m.id === machineId) || null;
+  const selectedMachine = machinesForFarm.find(m => m.id === machineId) || null;
   const canSubmit = farmId && retiroId && fieldId && opType && machineId && areaWorked && !horimetroError && !areaError && !busy;
 
   async function handleRegister() {
@@ -1149,9 +1154,9 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
             </select>
           </Field>
           <Field label="Máquina">
-            <select value={machineId} onChange={e => setMachineId(e.target.value)} disabled={!(machines || []).length}>
-              <option value="" disabled>{(machines || []).length ? "Selecione a máquina" : "Nenhuma máquina cadastrada"}</option>
-              {(machines || []).map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+            <select value={machineId} onChange={e => setMachineId(e.target.value)} disabled={!machinesForFarm.length}>
+              <option value="" disabled>{machinesForFarm.length ? "Selecione a máquina" : "Nenhuma máquina disponível para esta fazenda"}</option>
+              {machinesForFarm.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
             </select>
           </Field>
           <Field label="Área trabalhada (ha)"><input type="number" min="0" step="0.1" value={areaWorked} onChange={e => setAreaWorked(e.target.value)} /></Field>
@@ -1164,6 +1169,7 @@ function Lancamento({ farms, retiros, fields, hasFarms, hasFields, enabledOpType
         </div>
         {opTypeList.length === 0 && <div className="authError horimetroError">Nenhuma operação cadastrada ainda. Peça a um Administrador para cadastrar as operações em Cadastro antes de lançar.</div>}
         {!(machines && machines.length) && <div className="authError horimetroError">Nenhuma máquina cadastrada ainda. Peça a um Administrador para cadastrar máquinas em Cadastro antes de lançar operações.</div>}
+        {machines && machines.length > 0 && farmId && machinesForFarm.length === 0 && <div className="authError horimetroError">Nenhuma máquina está atribuída a esta fazenda. Peça a um Administrador para ajustar em Cadastro → Máquinas.</div>}
         {areaError && <div className="authError horimetroError">{areaError}</div>}
         {horimetroError && <div className="authError horimetroError">{horimetroError}</div>}
         {!horimetroError && hoursComputed !== null && <div className="horimetroInfo">Horas trabalhadas (calculado): <strong>{fmtNum(hoursComputed, 2)} h</strong></div>}
@@ -1274,7 +1280,7 @@ function Historico({ farms, retiros, fields, operations, profiles, currentUser, 
 function Cadastro({
   farms, retiros, fields, machines, opTypesRows, opMeta, users, currentUser,
   onAddFarm, onRemoveFarm, onAddRetiro, onRemoveRetiro, onRemoveField, onImportKml,
-  onAddMachine, onRemoveMachine, onAddCustomOpType,
+  onAddMachine, onRemoveMachine, onUpdateMachineFarm, onAddCustomOpType,
   onAddUser, onRemoveUser,
 }) {
   const [newFarm, setNewFarm] = useState("");
@@ -1360,7 +1366,7 @@ function Cadastro({
           <input type="text" placeholder="Nome da fazenda" value={newFarm} onChange={e => setNewFarm(e.target.value)} onKeyDown={e => e.key === "Enter" && handleAddFarm()} />
           <button className="btnPrimary" type="button" onClick={handleAddFarm}><Plus size={15} /> Adicionar</button>
         </div>
-        <ul className="listRows">
+        <ul className="listRows scrollList">
           {farms.map(f => <li key={f.id}><span>{f.name}</span><button className="iconBtn" onClick={() => onRemoveFarm(f.id)} title="Remover fazenda"><Trash2 size={14} /></button></li>)}
           {farms.length === 0 && <li className="emptyRow">Nenhuma fazenda cadastrada.</li>}
         </ul>
@@ -1376,7 +1382,7 @@ function Cadastro({
           <input type="text" placeholder="Nome do retiro" value={newRetiroName} onChange={e => setNewRetiroName(e.target.value)} disabled={!farms.length} onKeyDown={e => e.key === "Enter" && handleAddRetiro()} />
           <button className="btnPrimary" type="button" onClick={handleAddRetiro} disabled={!farms.length}><Plus size={15} /> Adicionar</button>
         </div>
-        <ul className="listRows">
+        <ul className="listRows scrollList">
           {retiros.map(r => (
             <li key={r.id}><span>{r.name} <em>· {farms.find(x => x.id === r.farm_id)?.name || "—"}</em></span>
               <button className="iconBtn" onClick={() => onRemoveRetiro(r.id)} title="Remover retiro"><Trash2 size={14} /></button>
@@ -1424,7 +1430,7 @@ function Cadastro({
         <div className="panelHead"><h2>Operações</h2></div>
         <p className="kmlHint">O sistema não vem com nenhuma operação pronta — cadastre abaixo os tipos que sua equipe usa (ex: Plantio, Colheita, Pulverização, Irrigação). Elas ficam disponíveis para lançamento e para os filtros do Painel.</p>
         {Object.keys(opMeta).length > 0 ? (
-          <div className="opTypeRow">
+          <div className="opTypeRow scrollList">
             {Object.entries(opMeta).map(([key, meta]) => {
               const Icon = meta.icon;
               return <span key={key} className="opStamp opStampStatic" style={{ "--stamp-color": meta.color }}><Icon size={16} />{meta.label}</span>;
@@ -1442,13 +1448,22 @@ function Cadastro({
 
       <section className="panel">
         <div className="panelHead"><h2>Máquinas</h2></div>
-        <p className="kmlHint">Cadastre as máquinas e implementos usados na fazenda. No lançamento, o operador escolhe uma máquina desta lista — é obrigatório informar qual foi usada.</p>
+        <p className="kmlHint">Cadastre as máquinas e implementos usados na fazenda. No lançamento, o operador escolhe uma máquina desta lista — é obrigatório informar qual foi usada. Indique em qual fazenda cada máquina está atualmente; ela só aparece pra lançamento nessa fazenda (máquinas sem fazenda definida aparecem em qualquer uma).</p>
         <div className="inlineForm">
           <input type="text" placeholder="Nome da máquina (ex: Trator MF 4275)" value={newMachine} onChange={e => setNewMachine(e.target.value)} onKeyDown={e => e.key === "Enter" && handleAddMachine()} />
           <button className="btnPrimary" type="button" onClick={handleAddMachine}><Plus size={15} /> Adicionar</button>
         </div>
-        <ul className="listRows">
-          {machines.map(m => <li key={m.id}><span>{m.name}</span><button className="iconBtn" onClick={() => onRemoveMachine(m.id)} title="Remover máquina"><Trash2 size={14} /></button></li>)}
+        <ul className="listRows scrollList">
+          {machines.map(m => (
+            <li key={m.id} className="machineRow">
+              <span className="machineName">{m.name}</span>
+              <select className="machineFarmSelect" value={m.farm_id || ""} onChange={e => onUpdateMachineFarm(m.id, e.target.value || null)} title="Fazenda onde a máquina está atualmente">
+                <option value="">Sem fazenda definida</option>
+                {farms.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+              </select>
+              <button className="iconBtn" onClick={() => onRemoveMachine(m.id)} title="Remover máquina"><Trash2 size={14} /></button>
+            </li>
+          ))}
           {machines.length === 0 && <li className="emptyRow">Nenhuma máquina cadastrada.</li>}
         </ul>
       </section>
@@ -1482,7 +1497,7 @@ function Cadastro({
           </div>
         )}
         {userError && <div className="authError userFormError">{userError}</div>}
-        <ul className="listRows">
+        <ul className="listRows scrollList">
           {users.map(u => {
             const roleMeta = ROLE_META[u.role] || ROLE_META.operador;
             const farmNames = u.role !== "gestor" ? (u.farm_ids || []).map(id => farms.find(f => f.id === id)?.name).filter(Boolean) : [];
@@ -1688,6 +1703,9 @@ function Style() {
       .listRows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
       .scrollList { max-height: 260px; overflow-y: auto; padding-right: 4px; }
       .listRows li { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: var(--cream); border-radius: 6px; font-size: 12.5px; color: var(--ink); }
+      .machineRow { gap: 8px; flex-wrap: wrap; }
+      .machineName { flex: 1; min-width: 100px; }
+      .machineFarmSelect { font-size: 11.5px; padding: 5px 7px; border-radius: 5px; border: 1px solid rgba(36,27,20,0.15); background: #fff; color: var(--ink); max-width: 180px; }
       .listRows li em { font-style: normal; color: var(--ink-soft); }
       .emptyRow { color: var(--ink-soft) !important; justify-content: center !important; }
 
